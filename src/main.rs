@@ -49,6 +49,9 @@ enum Commands {
         /// Quiet session log mirror on console
         #[arg(long, default_value_t = false)]
         quiet: bool,
+        /// Open the embedded web console in the default browser
+        #[arg(long, default_value_t = false)]
+        ui: bool,
     },
     /// Run from a TOML config file (advanced).
     Run {
@@ -67,6 +70,9 @@ enum Commands {
         /// Optional: override fanout.tcp_count
         #[arg(long)]
         tcp: Option<u32>,
+        /// Open the embedded web console in the default browser
+        #[arg(long, default_value_t = false)]
+        ui: bool,
     },
     /// Write a friendly sample config (platform-aware defaults).
     Init {
@@ -116,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
             tcp_base,
             api,
             quiet,
+            ui,
         } => {
             eprintln!("ohmyserial share");
             eprintln!("  device = {device}");
@@ -123,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("  pty    = {pty} virtual serial(s)  (Unix PTY)");
             eprintln!("  tcp    = {tcp} port(s) from {tcp_base}");
             eprintln!("  api/ws = {api}");
+            eprintln!("  ui     = http://{api}/");
             eprintln!();
 
             let cfg = Config::from_quick(QuickShare {
@@ -131,10 +139,10 @@ async fn main() -> anyhow::Result<()> {
                 pty_count: pty,
                 tcp_count: tcp,
                 tcp_base_port: tcp_base,
-                api_bind: api,
+                api_bind: api.clone(),
                 mirror_console: !quiet,
             })?;
-            run_until_ctrl_c(cfg).await
+            run_until_ctrl_c(cfg, ui, Some(api)).await
         }
         Commands::Run {
             config,
@@ -142,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
             baud,
             pty,
             tcp,
+            ui,
         } => {
             // Reload from disk so fanout overrides re-expand cleanly.
             let text = std::fs::read_to_string(&config)?;
@@ -160,8 +169,9 @@ async fn main() -> anyhow::Result<()> {
             }
             cfg.expand_fanout()?;
             cfg.validate()?;
+            let api_bind = cfg.api.bind.clone();
             tracing::info!("loaded config {}", config.display());
-            run_until_ctrl_c(cfg).await
+            run_until_ctrl_c(cfg, ui, Some(api_bind)).await
         }
         Commands::Init { output } => {
             let sample = sample_config();
@@ -208,8 +218,32 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn run_until_ctrl_c(cfg: Config) -> anyhow::Result<()> {
+async fn run_until_ctrl_c(
+    cfg: Config,
+    open_ui: bool,
+    api_bind: Option<String>,
+) -> anyhow::Result<()> {
+    let ui_url = api_bind
+        .as_ref()
+        .map(|b| format!("http://{b}/"))
+        .unwrap_or_else(|| "http://127.0.0.1:8787/".into());
+
     let handle = hub::run_hub(cfg).await?;
+
+    if ohmyserial::client::ui_embedded() {
+        eprintln!("Web UI: {ui_url}");
+        if open_ui {
+            match opener::open(&ui_url) {
+                Ok(()) => eprintln!("opened browser"),
+                Err(e) => eprintln!("could not open browser: {e} (open {ui_url} manually)"),
+            }
+        } else {
+            eprintln!("tip: re-run with --ui to open the console automatically");
+        }
+    } else {
+        eprintln!("Web UI not embedded (build web/dist then rebuild ohmyserial)");
+    }
+
     tracing::info!("press Ctrl+C to stop");
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutting down");

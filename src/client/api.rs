@@ -15,6 +15,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::broker::{Broker, WriteLockView};
+use crate::client::static_ui::{static_handler, ui_embedded};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -41,6 +42,8 @@ pub fn spawn_api_server(state: ApiState, bind: String) -> tokio::task::JoinHandl
             .route("/v1/lock", post(lock).delete(unlock))
             // Unlimited concurrent agents/monitors share the same stream path.
             .route("/v1/stream", get(ws_stream))
+            // React console embedded from web/dist (same origin as API).
+            .fallback(static_handler)
             .layer(cors)
             .layer(TraceLayer::new_for_http())
             .with_state(Arc::new(state));
@@ -60,7 +63,13 @@ pub fn spawn_api_server(state: ApiState, bind: String) -> tokio::task::JoinHandl
                 return;
             }
         };
-        tracing::info!("api listening on http://{bind}  (WS /v1/stream)");
+        if ui_embedded() {
+            tracing::info!(
+                "api+ui listening on http://{bind}/  (WS /v1/stream, UI /)"
+            );
+        } else {
+            tracing::info!("api listening on http://{bind}  (WS /v1/stream; UI not embedded)");
+        }
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!("api server error: {e}");
         }

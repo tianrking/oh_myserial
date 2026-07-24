@@ -22,6 +22,27 @@ type LogLine = {
 const STORAGE_KEY = "ohmyserial.web.conn";
 const CLIENT_NAME = "web-ui";
 
+function defaultConn(): ConnectionConfig {
+  // 同源：由 hub 提供 http://127.0.0.1:8787/ 時自動連同一主機埠
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname || "127.0.0.1";
+    const portStr = window.location.port;
+    const port = portStr
+      ? Number(portStr)
+      : window.location.protocol === "https:"
+        ? 443
+        : 80;
+    // Vite 開發伺服器 → 仍連預設 hub
+    if (port === 5173 || port === 4173) {
+      return { host: "127.0.0.1", port: 8787 };
+    }
+    if (host) {
+      return { host, port: port || 8787 };
+    }
+  }
+  return { host: "127.0.0.1", port: 8787 };
+}
+
 function loadConn(): ConnectionConfig {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -29,7 +50,7 @@ function loadConn(): ConnectionConfig {
   } catch {
     /* ignore */
   }
-  return { host: "127.0.0.1", port: 8787 };
+  return defaultConn();
 }
 
 function nowTs(): string {

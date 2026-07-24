@@ -562,17 +562,24 @@ oh_myserial/
 └── tests/
 ```
 
-### Optional web console
+### Web console (embedded + optional Vercel)
+
+The React UI is **embedded** into the hub binary (from `web/dist`):
 
 ```bash
-# terminal 1
-cargo run --release -- share mock:demo
-
-# terminal 2
-cd web && npm install && npm run dev
+cd web && npm ci && npm run build && cd ..
+cargo build --release
+./target/release/ohmyserial share mock:demo --ui
+# open http://127.0.0.1:8787/
 ```
 
-Open the Vite URL, click **連線**. Protocol: [`web/PROTOCOL.zh-TW.md`](./web/PROTOCOL.zh-TW.md).
+| Mode | URL |
+|------|-----|
+| **Recommended** | `http://127.0.0.1:8787/` same-origin UI + API + WS |
+| Dev hot-reload | `cd web && npm run dev` → localhost:5173 |
+| Optional CDN/Vercel | `web/vercel.json` (HTTPS→local WS may be blocked) |
+
+Protocol (zh-TW): [`web/PROTOCOL.zh-TW.md`](./web/PROTOCOL.zh-TW.md).
 
 ---
 

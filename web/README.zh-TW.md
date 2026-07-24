@@ -17,31 +17,46 @@
 | 協定說明分頁 | ✅ |
 | 完整協定文件 | ✅ `PROTOCOL.zh-TW.md` |
 
-## 本機開發
+## 推薦用法：嵌在 hub 裡（同源，最穩）
+
+先建置前端，再編譯 Rust（會把 `web/dist` 嵌進二進位）：
 
 ```bash
-# 終端 1：啟動 hub
-cd ..
-cargo run --release -- share mock:demo --pty 2
+cd web && npm install && npm run build && cd ..
+cargo build --release
 
-# 終端 2：啟動網頁
-cd web
-npm install
-npm run dev
+# 一鍵共享並開啟瀏覽器控制台
+./target/release/ohmyserial share mock:demo --ui
+# 或真實裝置
+./target/release/ohmyserial share /dev/cu.usbmodemXXXX --pty 2 --ui
 ```
 
-瀏覽器開啟 Vite 提示的位址（通常 `http://localhost:5173`），點「連線」。
+瀏覽器開啟：**http://127.0.0.1:8787/**（與 API/WS 同源，無混合內容問題）。  
+點「連線」即可（預設已填同一 host/port）。
 
-## 建置靜態站（可部署 Vercel）
+## 本機熱重載開發（可選）
+
+```bash
+# 終端 1：hub
+cargo run --release -- share mock:demo --pty 2
+
+# 終端 2：Vite
+cd web && npm run dev
+```
+
+通常 `http://localhost:5173`，網頁會連 `127.0.0.1:8787`。
+
+## 部署到 Vercel（可選鏡像）
 
 ```bash
 cd web
 npm run build
-# 產物在 dist/
+# 使用 vercel.json；Root Directory 選 web
+vercel --prod
 ```
 
-> **注意**：若部署在 **HTTPS**（Vercel），瀏覽器可能封鎖連到 `ws://127.0.0.1`。  
-> 開發與實務操控建議用 `http://localhost` 開啟本頁。詳見 `PROTOCOL.zh-TW.md` §2.4。
+> **注意**：HTTPS 的 Vercel 頁連 `ws://127.0.0.1` 可能被瀏覽器封鎖。  
+> **實務請優先用本機** `http://127.0.0.1:8787/`。詳見 `PROTOCOL.zh-TW.md` §2.4。
 
 ## 目錄
 

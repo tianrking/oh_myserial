@@ -383,7 +383,15 @@ impl Config {
         }
 
         lines.push("├─────────────────────────────────────────────────────────────┤".into());
+        if self.api.enabled {
+            lines.push(format!(
+                "│  UI     {url:<52}│",
+                url = truncate(&format!("http://{}/", self.api.bind), 52)
+            ));
+        }
+        lines.push("├─────────────────────────────────────────────────────────────┤".into());
         lines.push("│  Tips                                                       │".into());
+        lines.push("│  • Browser UI: open the UI URL above (embedded console)     │".into());
         lines.push("│  • Open each SERIAL path in a different serial app          │".into());
         lines.push("│  • Agent: WebSocket stream + HTTP POST /v1/write            │".into());
         lines.push("│  • Many programs can share one TCP port                     │".into());
