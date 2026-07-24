@@ -175,6 +175,9 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
         cfg.endpoint_catalog().len()
     );
 
+    // Always print a plain human guide (not only tracing).
+    eprint!("{}", cfg.connect_guide());
+
     Ok(HubHandle {
         serial,
         tasks,

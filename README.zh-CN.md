@@ -237,49 +237,36 @@ cargo test
 
 ---
 
-## 快速开始
+## 快速开始（最省事）
 
-### 1）生成配置
-
-```bash
-./target/release/ohmyserial init -o ohmyserial.toml
-```
-
-默认 **`path = "mock:demo"`**，无需硬件。
-
-### 2）启动
+**不用写配置文件**，一条命令：
 
 ```bash
-./target/release/ohmyserial run -c ohmyserial.toml
-```
-
-| 服务 | 默认地址 |
-|------|----------|
-| HTTP / WebSocket | `http://127.0.0.1:8787` · `ws://127.0.0.1:8787/v1/stream` |
-| TCP | `127.0.0.1:8788` |
-
-### 3）试 API
-
-```bash
-curl -s http://127.0.0.1:8787/v1/health
-curl -s -X POST http://127.0.0.1:8787/v1/write \
-  -H 'content-type: application/json' \
-  -d '{"text":"hello","newline":true}'
-```
-
-### 4）接真设备
-
-```toml
-[real]
-path = "/dev/cu.usbmodem14101"   # macOS
-# path = "/dev/ttyUSB0"          # Linux
-# path = "COM3"                  # Windows
-baud = 115200
-```
-
-```bash
+# 1) 看本机有哪些串口
 ./target/release/ohmyserial list-ports
+
+# 2) 共享（macOS/Linux 默认并联 2 个虚拟串口 + TCP + WebSocket）
+./target/release/ohmyserial share /dev/cu.usbmodem14101 --baud 115200
+
+# 要 3 个虚拟串口给 3 个上位机
+./target/release/ohmyserial share /dev/ttyUSB0 --pty 3
+
+# Windows：没有 PTY，用多 TCP + 多 WS
+./target/release/ohmyserial share COM3 --tcp 2
+
+# 无硬件演示
+./target/release/ohmyserial share mock:demo
 ```
+
+启动后终端会打印 **连接卡片**（SERIAL / TCP / WS 地址）。
+
+| 参数 | 含义 | 默认 |
+|------|------|------|
+| `--pty N` | N 个虚拟串口（Unix） | macOS/Linux=`2`，Windows=`0` |
+| `--tcp N` | N 个 TCP 端口 | `1` |
+| `--api` | HTTP/WS 地址 | `127.0.0.1:8787` |
+
+高级：`init` 生成 TOML，或 `run -c file.toml -d 设备 --pty 3`。
 
 ---
 

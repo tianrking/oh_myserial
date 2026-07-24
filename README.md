@@ -246,50 +246,54 @@ cargo test
 
 ---
 
-## Quick start
+## Quick start (easiest)
 
-### 1) Create config
+**No config file needed** — use `share`:
+
+```bash
+# 1) see ports
+./target/release/ohmyserial list-ports
+
+# 2) share one (macOS/Linux: 2 virtual serials by default + TCP + WebSocket)
+./target/release/ohmyserial share /dev/cu.usbmodem14101 --baud 115200
+
+# more virtual serials for more serial GUIs
+./target/release/ohmyserial share /dev/ttyUSB0 --pty 3 --tcp 1
+
+# Windows (no PTY): multi TCP + multi WS clients
+./target/release/ohmyserial share COM3 --tcp 2
+
+# no hardware (demo)
+./target/release/ohmyserial share mock:demo
+```
+
+On start, ohmyserial prints a **connect card**, e.g.:
+
+```text
+SERIAL  /tmp/ohmyserial-v0     ← open in serial app #1
+SERIAL  /tmp/ohmyserial-v1     ← open in serial app #2
+TCP     127.0.0.1:8788         ← nc / scripts (many clients OK)
+WS      ws://127.0.0.1:8787/v1/stream
+HTTP    http://127.0.0.1:8787
+```
+
+### Flags people use most
+
+| Flag | Meaning | Default |
+|------|---------|---------|
+| `--pty N` | N virtual serial ports (Unix) | `2` on macOS/Linux, `0` on Windows |
+| `--tcp N` | N TCP ports | `1` |
+| `--tcp-base P` | first TCP port | `8788` |
+| `--api ADDR` | HTTP/WS bind | `127.0.0.1:8787` |
+| `-b/--baud` | baud rate | `115200` |
+
+### Optional: config file
 
 ```bash
 ./target/release/ohmyserial init -o ohmyserial.toml
-```
-
-Default sample uses **`path = "mock:demo"`** (no hardware required).
-
-### 2) Run hub
-
-```bash
 ./target/release/ohmyserial run -c ohmyserial.toml
-```
-
-Defaults:
-
-| Service | Address |
-|---------|---------|
-| HTTP / WebSocket API | `http://127.0.0.1:8787` · `ws://127.0.0.1:8787/v1/stream` |
-| TCP stream | `127.0.0.1:8788` |
-
-### 3) Try the API
-
-```bash
-curl -s http://127.0.0.1:8787/v1/health
-curl -s -X POST http://127.0.0.1:8787/v1/write \
-  -H 'content-type: application/json' \
-  -d '{"text":"hello","newline":true}'
-```
-
-### 4) Attach real hardware
-
-```toml
-[real]
-path = "/dev/cu.usbmodem14101"   # macOS
-# path = "/dev/ttyUSB0"          # Linux
-# path = "COM3"                  # Windows
-baud = 115200
-```
-
-```bash
-./target/release/ohmyserial list-ports
+# overrides without editing file:
+./target/release/ohmyserial run -c ohmyserial.toml -d /dev/ttyUSB0 --pty 3
 ```
 
 ---

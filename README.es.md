@@ -239,49 +239,20 @@ cargo test
 
 ---
 
-## Inicio rápido
+## Inicio rápido (lo más fácil)
 
-### 1) Crear configuración
-
-```bash
-./target/release/ohmyserial init -o ohmyserial.toml
-```
-
-El ejemplo usa **`path = "mock:demo"`** (sin hardware).
-
-### 2) Ejecutar el hub
-
-```bash
-./target/release/ohmyserial run -c ohmyserial.toml
-```
-
-| Servicio | Dirección por defecto |
-|----------|------------------------|
-| HTTP / WebSocket | `http://127.0.0.1:8787` · `ws://127.0.0.1:8787/v1/stream` |
-| TCP | `127.0.0.1:8788` |
-
-### 3) Probar la API
-
-```bash
-curl -s http://127.0.0.1:8787/v1/health
-curl -s -X POST http://127.0.0.1:8787/v1/write \
-  -H 'content-type: application/json' \
-  -d '{"text":"hello","newline":true}'
-```
-
-### 4) Hardware real
-
-```toml
-[real]
-path = "/dev/cu.usbmodem14101"   # macOS
-# path = "/dev/ttyUSB0"          # Linux
-# path = "COM3"                  # Windows
-baud = 115200
-```
+**Sin archivo de configuración:**
 
 ```bash
 ./target/release/ohmyserial list-ports
+./target/release/ohmyserial share /dev/cu.usbmodem14101 --baud 115200
+./target/release/ohmyserial share /dev/ttyUSB0 --pty 3
+./target/release/ohmyserial share COM3 --tcp 2          # Windows
+./target/release/ohmyserial share mock:demo
 ```
+
+Por defecto en macOS/Linux: **2 series virtuales (PTY)** + TCP + WebSocket.  
+Al arrancar imprime una **tarjeta de conexión** (SERIAL / TCP / WS).
 
 ---
 

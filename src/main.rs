@@ -5,14 +5,20 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use ohmyserial::config::Config;
+use ohmyserial::config::{Config, QuickShare};
 use ohmyserial::{hub, serial};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "ohmyserial",
     version,
-    about = "Cross-platform open-source serial hub for humans and agents"
+    about = "Share one serial port with many apps and AI agents",
+    long_about = "ohmyserial opens a real UART once, then fans out to virtual serial ports (Unix), \
+TCP streams, and WebSocket/HTTP for agents.\n\n\
+Quick start (no config file):\n  \
+  ohmyserial share /dev/cu.usbmodem14101 --pty 3\n  \
+  ohmyserial share COM3 --tcp 2\n  \
+  ohmyserial share mock:demo"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -21,13 +27,48 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run the serial hub from a TOML config file.
+    /// Easiest: share a serial port with multi PTY / TCP / WebSocket (no TOML needed).
+    Share {
+        /// Real device path, e.g. /dev/cu.usbmodem*, /dev/ttyUSB0, COM3, or mock:demo
+        device: String,
+        /// Baud rate
+        #[arg(short, long, default_value_t = 115_200)]
+        baud: u32,
+        /// Number of virtual serial ports (macOS/Linux PTY). Default: 2 on Unix, 0 on Windows.
+        #[arg(long, default_value_t = default_pty_cli())]
+        pty: u32,
+        /// Number of TCP fan-out ports (each accepts many clients). Default: 1
+        #[arg(long, default_value_t = 1)]
+        tcp: u32,
+        /// First TCP port (then +1, +2, …)
+        #[arg(long, default_value_t = 8788)]
+        tcp_base: u16,
+        /// HTTP + WebSocket API bind
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        api: String,
+        /// Quiet session log mirror on console
+        #[arg(long, default_value_t = false)]
+        quiet: bool,
+    },
+    /// Run from a TOML config file (advanced).
     Run {
         /// Path to config TOML.
         #[arg(short, long, default_value = "ohmyserial.toml")]
         config: PathBuf,
+        /// Optional: override real.port path without editing the file
+        #[arg(short = 'd', long)]
+        device: Option<String>,
+        /// Optional: override baud
+        #[arg(short, long)]
+        baud: Option<u32>,
+        /// Optional: override fanout.pty_count
+        #[arg(long)]
+        pty: Option<u32>,
+        /// Optional: override fanout.tcp_count
+        #[arg(long)]
+        tcp: Option<u32>,
     },
-    /// Print a sample config to stdout.
+    /// Write a friendly sample config (platform-aware defaults).
     Init {
         /// Write to file instead of stdout.
         #[arg(short, long)]
@@ -35,11 +76,25 @@ enum Commands {
     },
     /// List serial ports visible on this machine.
     ListPorts,
-    /// Print status of a running hub via HTTP API.
+    /// Print status / endpoints of a running hub.
     Status {
         #[arg(long, default_value = "http://127.0.0.1:8787")]
         api: String,
+        /// Show only fan-out endpoints
+        #[arg(long, default_value_t = false)]
+        endpoints: bool,
     },
+}
+
+fn default_pty_cli() -> u32 {
+    #[cfg(unix)]
+    {
+        2
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 #[tokio::main]
@@ -53,60 +108,119 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Commands::Run { config } => {
-            let cfg = Config::load(&config)?;
+        Commands::Share {
+            device,
+            baud,
+            pty,
+            tcp,
+            tcp_base,
+            api,
+            quiet,
+        } => {
+            eprintln!("ohmyserial share");
+            eprintln!("  device = {device}");
+            eprintln!("  baud   = {baud}");
+            eprintln!("  pty    = {pty} virtual serial(s)  (Unix PTY)");
+            eprintln!("  tcp    = {tcp} port(s) from {tcp_base}");
+            eprintln!("  api/ws = {api}");
+            eprintln!();
+
+            let cfg = Config::from_quick(QuickShare {
+                device,
+                baud,
+                pty_count: pty,
+                tcp_count: tcp,
+                tcp_base_port: tcp_base,
+                api_bind: api,
+                mirror_console: !quiet,
+            })?;
+            run_until_ctrl_c(cfg).await
+        }
+        Commands::Run {
+            config,
+            device,
+            baud,
+            pty,
+            tcp,
+        } => {
+            // Reload from disk so fanout overrides re-expand cleanly.
+            let text = std::fs::read_to_string(&config)?;
+            let mut cfg: Config = toml::from_str(&text)?;
+            if let Some(d) = device {
+                cfg.real.path = d;
+            }
+            if let Some(b) = baud {
+                cfg.real.baud = b;
+            }
+            if let Some(p) = pty {
+                cfg.fanout.pty_count = p;
+            }
+            if let Some(t) = tcp {
+                cfg.fanout.tcp_count = t;
+            }
+            cfg.expand_fanout()?;
+            cfg.validate()?;
             tracing::info!("loaded config {}", config.display());
-            let handle = hub::run_hub(cfg).await?;
-            tracing::info!("press Ctrl+C to stop");
-            tokio::signal::ctrl_c().await?;
-            tracing::info!("shutting down");
-            handle.shutdown();
-            Ok(())
+            run_until_ctrl_c(cfg).await
         }
         Commands::Init { output } => {
             let sample = sample_config();
             if let Some(path) = output {
-                std::fs::write(&path, sample)?;
+                std::fs::write(&path, &sample)?;
                 eprintln!("wrote {}", path.display());
+                eprintln!();
+                eprintln!("Next:");
+                eprintln!("  1) edit real.path  (or use: ohmyserial share <device> --pty 3)");
+                eprintln!("  2) ohmyserial run -c {}", path.display());
             } else {
                 print!("{sample}");
             }
             Ok(())
         }
         Commands::ListPorts => {
-            for p in serial::list_ports()? {
-                println!("{p}");
+            let ports = serial::list_ports()?;
+            if ports.is_empty() {
+                eprintln!("(no serial ports found)");
+            } else {
+                eprintln!("Available serial ports:\n");
+                for p in &ports {
+                    println!("  {p}");
+                }
+                eprintln!();
+                eprintln!("Share one with:");
+                eprintln!("  ohmyserial share <DEVICE> --pty 3 --tcp 1");
+                eprintln!("Example:");
+                if let Some(first) = ports.first() {
+                    // port lines look like: "/dev/cu.xxx (UsbPort)" — take first token
+                    let dev = first.split_whitespace().next().unwrap_or(first);
+                    eprintln!("  ohmyserial share {dev} --baud 115200");
+                }
             }
             Ok(())
         }
-        Commands::Status { api } => {
-            let url = format!("{}/v1/status", api.trim_end_matches('/'));
-            let body = reqwest_get(&url).await?;
+        Commands::Status { api, endpoints } => {
+            let path = if endpoints { "/v1/endpoints" } else { "/v1/status" };
+            let url = format!("{}{}", api.trim_end_matches('/'), path);
+            let body = simple_http_get(&url).await?;
             println!("{body}");
             Ok(())
         }
     }
 }
 
-/// Minimal HTTP GET without adding reqwest dep — use hyper via awc? Keep simple with std + tokio.
-async fn reqwest_get(url: &str) -> anyhow::Result<String> {
-    // Use ureq-less approach: tokio tcp is messy for HTTP.
-    // Prefer adding no extra dep: shell out is bad.
-    // Use `http` raw via hyper is already in axum tree... simplest: use std::process? No.
-    // Add nothing — parse URL and use hyper client from axum deps... axum doesn't export client.
-    // Use `tokio::process` curl? Portable enough fallback:
-    match simple_http_get(url).await {
-        Ok(s) => Ok(s),
-        Err(_) => {
-            // last resort: tell user to curl
-            anyhow::bail!("failed to GET {url}; try: curl -s {url}")
-        }
-    }
+async fn run_until_ctrl_c(cfg: Config) -> anyhow::Result<()> {
+    let handle = hub::run_hub(cfg).await?;
+    tracing::info!("press Ctrl+C to stop");
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("shutting down");
+    handle.shutdown();
+    Ok(())
 }
 
 async fn simple_http_get(url: &str) -> anyhow::Result<String> {
-    // Very small HTTP/1.1 client for http://host:port/path
-    let url = url.strip_prefix("http://").ok_or_else(|| anyhow::anyhow!("only http:// supported"))?;
+    let url = url
+        .strip_prefix("http://")
+        .ok_or_else(|| anyhow::anyhow!("only http:// supported"))?;
     let (host_port, path) = url
         .split_once('/')
         .map(|(h, p)| (h, format!("/{p}")))
@@ -129,10 +243,17 @@ async fn simple_http_get(url: &str) -> anyhow::Result<String> {
 }
 
 fn sample_config() -> String {
-    r#"# oh_myserial — one real serial port, many parallel monitors / agents
-#
-# Real port: device path, or "mock:demo" for loopback without hardware.
-# Fan-out: every RX byte is broadcast; TX is arbitrated (see [tx]).
+    let pty_default = default_pty_cli();
+    let pty_hint = if cfg!(unix) {
+        "# macOS/Linux: 2 virtual serials ready for two serial apps"
+    } else {
+        "# Windows: PTY not available — use TCP + WebSocket (set pty_count = 0)"
+    };
+    format!(
+        r#"# oh_myserial — friendly sample
+# Tip: you often don't need this file:
+#   ohmyserial share /dev/cu.usbmodemXXXX --pty 3
+#   ohmyserial share COM3 --tcp 2
 
 [real]
 path = "mock:demo"
@@ -145,62 +266,34 @@ reconnect = true
 reconnect_ms = 1000
 
 [tx]
-mode = "queue_by_line"   # queue_by_line | queue_by_frame | exclusive | primary_wins
+mode = "queue_by_line"
 primary = "ui"
 write_lock_ms = 3000
 slow_client = "drop_oldest"
 
-# Primary HTTP + WebSocket API (many agents can open /v1/stream at once)
 [api]
 bind = "127.0.0.1:8787"
 enabled = true
 
-# ---- Bulk fan-out (recommended): 1 real → N virtual / network endpoints ----
 [fanout]
-# Unix virtual serial (macOS/Linux only). Set >0 to create /tmp/ohmyserial-v0, v1, …
-# Open each path in a different serial monitor. Windows: leave 0, use TCP/WS.
-pty_count = 0
+{pty_hint}
+pty_count = {pty_default}
 pty_link_prefix = "/tmp/ohmyserial-v"
 pty_name_prefix = "v"
 pty_can_write = true
 pty_can_read = true
 
-# TCP listeners: each port accepts MANY concurrent clients (all get full RX).
-# Example: 2 ports → 8788 and 8789; any number of programs may connect to each.
-tcp_count = 2
+# TCP: one port is enough for many concurrent programs
+tcp_count = 1
 tcp_host = "127.0.0.1"
 tcp_base_port = 8788
 tcp_name_prefix = "tcp"
 tcp_can_write = true
 tcp_can_read = true
 
-# Extra dedicated HTTP/WS servers (optional; primary [api] already multi-client)
-# ws_binds = ["127.0.0.1:8790"]
-# ws_name_prefix = "ws"
-# ws_history_bytes = 65536
-
-# ---- Or declare endpoints one-by-one (merged with [fanout]) ----
-# [[clients]]
-# type = "pty"
-# name = "ui"
-# link = "/tmp/ohmyserial-ui"
-# can_write = true
-# can_read = true
-#
-# [[clients]]
-# type = "tcp"
-# name = "script"
-# bind = "127.0.0.1:8800"
-#
-# [[clients]]
-# type = "websocket"
-# name = "agent"
-# history_bytes = 65536
-
 [log]
-# file = "logs/session.blog"
 mirror_console = true
 format = "hex+text"
 "#
-    .to_string()
+    )
 }

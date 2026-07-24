@@ -255,6 +255,44 @@ pub struct EndpointDesc {
     pub note: String,
 }
 
+/// Options for one-shot CLI share (no TOML required).
+#[derive(Debug, Clone)]
+pub struct QuickShare {
+    pub device: String,
+    pub baud: u32,
+    pub pty_count: u32,
+    pub tcp_count: u32,
+    pub tcp_base_port: u16,
+    pub api_bind: String,
+    pub mirror_console: bool,
+}
+
+impl Default for QuickShare {
+    fn default() -> Self {
+        Self {
+            device: "mock:demo".into(),
+            baud: 115_200,
+            // People-friendly defaults: 2 virtual serials on Unix; TCP everywhere.
+            pty_count: default_friendly_pty_count(),
+            tcp_count: 1,
+            tcp_base_port: 8788,
+            api_bind: "127.0.0.1:8787".into(),
+            mirror_console: true,
+        }
+    }
+}
+
+fn default_friendly_pty_count() -> u32 {
+    #[cfg(unix)]
+    {
+        2
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
 impl Config {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
@@ -262,6 +300,98 @@ impl Config {
         cfg.expand_fanout()?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Build a ready-to-run config from CLI flags (zero TOML for common cases).
+    pub fn from_quick(q: QuickShare) -> anyhow::Result<Self> {
+        let mut cfg = Config {
+            real: RealPortConfig {
+                path: q.device,
+                baud: q.baud,
+                databits: 8,
+                parity: "none".into(),
+                stopbits: 1,
+                flow: "none".into(),
+                reconnect: true,
+                reconnect_ms: 1000,
+                read_timeout_ms: 50,
+            },
+            tx: TxConfig::default(),
+            clients: Vec::new(),
+            fanout: FanoutConfig {
+                pty_count: q.pty_count,
+                pty_link_prefix: default_pty_link_prefix(),
+                pty_name_prefix: default_pty_name_prefix(),
+                pty_can_write: true,
+                pty_can_read: true,
+                tcp_count: q.tcp_count,
+                tcp_host: default_tcp_host(),
+                tcp_base_port: q.tcp_base_port,
+                tcp_name_prefix: default_tcp_name_prefix(),
+                tcp_can_write: true,
+                tcp_can_read: true,
+                ws_binds: Vec::new(),
+                ws_name_prefix: default_ws_name_prefix(),
+                ws_history_bytes: default_history_bytes(),
+                ws_can_write: true,
+                ws_can_read: true,
+            },
+            log: LogConfig {
+                file: None,
+                mirror_console: q.mirror_console,
+                format: "hex+text".into(),
+            },
+            api: ApiConfig {
+                bind: q.api_bind,
+                enabled: true,
+            },
+        };
+        cfg.expand_fanout()?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Human-readable "how to connect" card for terminals.
+    pub fn connect_guide(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(String::new());
+        lines.push("┌─────────────────────────────────────────────────────────────┐".into());
+        lines.push("│  ohmyserial — how to connect (same live data everywhere)   │".into());
+        lines.push("├─────────────────────────────────────────────────────────────┤".into());
+        lines.push(format!(
+            "│  REAL   {path:<52}│",
+            path = truncate(&self.real.path, 52)
+        ));
+        lines.push(format!(
+            "│  BAUD   {baud:<52}│",
+            baud = self.real.baud.to_string()
+        ));
+        lines.push("├─────────────────────────────────────────────────────────────┤".into());
+
+        for ep in self.endpoint_catalog() {
+            let label = match ep.kind.as_str() {
+                "pty" => "SERIAL",
+                "tcp" => "TCP   ",
+                "websocket" => "WS    ",
+                "http" => "HTTP  ",
+                _ => "OTHER ",
+            };
+            lines.push(format!(
+                "│  {label} {addr:<52}│",
+                addr = truncate(&ep.address, 52)
+            ));
+        }
+
+        lines.push("├─────────────────────────────────────────────────────────────┤".into());
+        lines.push("│  Tips                                                       │".into());
+        lines.push("│  • Open each SERIAL path in a different serial app          │".into());
+        lines.push("│  • Agent: WebSocket stream + HTTP POST /v1/write            │".into());
+        lines.push("│  • Many programs can share one TCP port                     │".into());
+        lines.push("│  • curl http://127.0.0.1:8787/v1/endpoints                  │".into());
+        lines.push("│  • Ctrl+C to stop                                           │".into());
+        lines.push("└─────────────────────────────────────────────────────────────┘".into());
+        lines.push(String::new());
+        lines.join("\n")
     }
 
     /// Expand `[fanout]` into concrete `[[clients]]` entries (idempotent names).
@@ -462,6 +592,16 @@ impl Config {
     }
 }
 
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        format!("{s:<max$}")
+    } else {
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        t.push('…');
+        format!("{t:<max$}")
+    }
+}
+
 fn default_baud() -> u32 {
     115_200
 }
@@ -558,6 +698,25 @@ bind = "127.0.0.1:9999"
         cfg.validate().unwrap();
         assert_eq!(cfg.real.baud, 9600);
         assert_eq!(cfg.clients.len(), 1);
+    }
+
+    #[test]
+    fn quick_share_builds() {
+        let cfg = Config::from_quick(QuickShare {
+            device: "mock:x".into(),
+            baud: 9600,
+            pty_count: 0,
+            tcp_count: 2,
+            tcp_base_port: 19010,
+            api_bind: "127.0.0.1:19011".into(),
+            mirror_console: false,
+        })
+        .unwrap();
+        assert_eq!(cfg.real.baud, 9600);
+        assert_eq!(cfg.clients.len(), 2);
+        let guide = cfg.connect_guide();
+        assert!(guide.contains("how to connect"));
+        assert!(guide.contains("19010") || guide.contains("TCP"));
     }
 
     #[test]
