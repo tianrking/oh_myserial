@@ -5,7 +5,7 @@ edition = "2021"
 description = "Cross-platform open-source serial hub for humans and agents"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/example/oh_myserial"
+repository = "https://github.com/tianrking/oh_myserial"
 keywords = ["serial", "uart", "hub", "websocket", "embedded"]
 categories = ["command-line-utilities", "network-programming"]
 
