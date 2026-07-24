@@ -27,7 +27,9 @@
   <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
   <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/rust-edition%202021-orange?style=flat-square&logo=rust" /></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square" />
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.0.1-blue?style=flat-square" />
   <img alt="Status" src="https://img.shields.io/badge/status-MVP-22c55e?style=flat-square" />
+  <a href="https://github.com/tianrking/oh_myserial/releases/tag/v0.0.1"><img alt="Release" src="https://img.shields.io/badge/release-v0.0.1-0ea5e9?style=flat-square" /></a>
   <a href="https://github.com/tianrking/oh_myserial"><img alt="GitHub" src="https://img.shields.io/badge/github-tianrking%2Foh__myserial-181717?style=flat-square&logo=github" /></a>
 </p>
 
@@ -211,25 +213,38 @@ CLI / Config
 
 ## Install & build
 
-### Requirements
+### Prebuilt binaries (v0.0.1+)
+
+Download from [GitHub Releases](https://github.com/tianrking/oh_myserial/releases):
+
+| Platform | Artifact |
+|----------|----------|
+| Linux x86_64 | `…-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `…-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `…-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `…-x86_64-apple-darwin.tar.gz` |
+| Windows x64 | `…-x86_64-pc-windows-msvc.zip` |
+| Windows ARM64 | `…-aarch64-pc-windows-msvc.zip` |
+
+```bash
+# example (Linux/macOS)
+tar -xzf ohmyserial-v0.0.1-<target>.tar.gz
+./ohmyserial-v0.0.1-<target>/ohmyserial share mock:demo --ui
+```
+
+### Requirements (from source)
 
 - [Rust](https://rustup.rs/) stable  
-- **Ubuntu/Debian:**
-
-  ```bash
-  sudo apt update
-  sudo apt install -y build-essential pkg-config libudev-dev
-  ```
-
-- **macOS:** Xcode Command Line Tools  
-- **Windows:** MSVC toolchain via rustup  
+- **Ubuntu/Debian:** `build-essential pkg-config libudev-dev`  
+- **macOS:** Xcode CLT · **Windows:** MSVC via rustup  
 
 ### Build from source
 
 ```bash
 git clone https://github.com/tianrking/oh_myserial.git
 cd oh_myserial
-cargo build --release
+./scripts/build-all.sh   # web + cargo release
+# or: cargo build --release   # uses committed web/dist
 ```
 
 | OS | Binary |
@@ -242,7 +257,18 @@ cargo build --release
 ```bash
 cargo test
 ./target/release/ohmyserial --help
+./target/release/ohmyserial share mock:demo --ui
 ```
+
+### CI matrix
+
+GitHub Actions builds & tests on:
+
+- Linux x64 / arm64  
+- macOS arm64 / x64  
+- Windows x64 / arm64  
+
+Tagged releases (`v*`) publish archives automatically.
 
 ---
 

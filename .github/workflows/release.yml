@@ -1,0 +1,167 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.0.1)"
+        required: true
+        default: "v0.0.1"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: ohmyserial
+            asset_ext: tar.gz
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bin: ohmyserial
+            asset_ext: tar.gz
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bin: ohmyserial
+            asset_ext: tar.gz
+          - name: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bin: ohmyserial
+            asset_ext: tar.gz
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: ohmyserial.exe
+            asset_ext: zip
+          - name: windows-arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bin: ohmyserial.exe
+            asset_ext: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux serial deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libudev-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          STAGE="ohmyserial-${TAG}-${{ matrix.target }}"
+          mkdir -p "pkg/${STAGE}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "pkg/${STAGE}/"
+          cp README.md LICENSE ohmyserial.example.toml "pkg/${STAGE}/" || true
+          cp web/PROTOCOL.zh-TW.md "pkg/${STAGE}/" || true
+          cd pkg
+          if [[ "${{ matrix.asset_ext }}" == "zip" ]]; then
+            7z a "${STAGE}.zip" "${STAGE}"
+            echo "ASSET=${STAGE}.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "${STAGE}.tar.gz" "${STAGE}"
+            echo "ASSET=${STAGE}.tar.gz" >> "$GITHUB_ENV"
+          fi
+          ls -la
+
+      - name: Upload release asset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: pkg/${{ env.ASSET }}
+
+  publish:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: release-*
+          merge-multiple: true
+
+      - name: List assets
+        run: find release-assets -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          body: |
+            ## ohmyserial ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+            Cross-platform serial hub for humans and agents.
+
+            ### Assets
+            Prebuilt binaries for:
+            - Linux x86_64 / aarch64
+            - macOS Apple Silicon / Intel
+            - Windows x86_64 / ARM64
+
+            ### Quick start
+            ```bash
+            # extract, then:
+            ./ohmyserial share mock:demo --ui
+            # open http://127.0.0.1:8787/
+            ```
+
+            ### Notes
+            - Ubuntu/Debian build requires `libudev` at runtime for real serial ports.
+            - Embedded web console is included in the binary.
+          files: |
+            release-assets/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

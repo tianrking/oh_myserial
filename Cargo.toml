@@ -1,6 +1,6 @@
 [package]
 name = "ohmyserial"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 description = "Cross-platform open-source serial hub for humans and agents"
 license = "MIT"

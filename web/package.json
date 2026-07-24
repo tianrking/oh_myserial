@@ -1,7 +1,7 @@
 {
   "name": "ohmyserial-web",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "ohmyserial 本機串口共享控制台（繁體中文）",
   "type": "module",
   "scripts": {
