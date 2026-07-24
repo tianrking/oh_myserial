@@ -6,8 +6,19 @@ description = "Cross-platform open-source serial hub for humans and agents"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/tianrking/oh_myserial"
-keywords = ["serial", "uart", "hub", "websocket", "embedded"]
-categories = ["command-line-utilities", "network-programming"]
+keywords = [
+    "serial",
+    "uart",
+    "hub",
+    "websocket",
+    "embedded",
+    "com-port",
+    "tty",
+    "agent",
+    "multiplexer",
+    "cross-platform",
+]
+categories = ["command-line-utilities", "network-programming", "asynchronous"]
 
 [dependencies]
 anyhow = "1"

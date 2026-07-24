@@ -1,111 +1,211 @@
 # ohmyserial
 
 <p align="center">
-  <strong>Cross-platform open-source serial hub for humans and agents</strong>
+  <img alt="ohmyserial" src="https://img.shields.io/badge/ohmyserial-serial%20hub-0ea5e9?style=for-the-badge&logo=rust&logoColor=white" />
 </p>
 
 <p align="center">
-  One real UART · Many safe clients · Zero silent TX fights
+  <strong>Cross-platform open-source serial hub for humans and agents</strong><br/>
+  <em>One real UART · Many safe clients · Zero silent TX fights</em>
 </p>
 
 <p align="center">
-  <a href="https://github.com/tianrking/oh_myserial/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/tianrking/oh_myserial/ci.yml?branch=main&style=flat-square&label=CI" /></a>
+  <a href="./README.md"><img alt="English" src="https://img.shields.io/badge/lang-English-blue?style=flat-square" /></a>
+  <a href="./README.zh-CN.md"><img alt="简体中文" src="https://img.shields.io/badge/lang-简体中文-red?style=flat-square" /></a>
+  <a href="./README.es.md"><img alt="Español" src="https://img.shields.io/badge/lang-Español-green?style=flat-square" /></a>
+</p>
+
+<p align="center">
+  <b>Languages:</b>
+  <a href="./README.md">English</a> ·
+  <a href="./README.zh-CN.md">简体中文</a> ·
+  <a href="./README.es.md">Español</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/tianrking/oh_myserial/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/tianrking/oh_myserial/ci.yml?branch=main&style=flat-square&label=CI" /></a>
   <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" /></a>
-  <a href="./Cargo.toml"><img alt="Rust" src="https://img.shields.io/badge/rust-1.70%2B-orange?style=flat-square" /></a>
+  <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/rust-edition%202021-orange?style=flat-square&logo=rust" /></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square" />
-  <img alt="Status" src="https://img.shields.io/badge/status-MVP-green?style=flat-square" />
+  <img alt="Status" src="https://img.shields.io/badge/status-MVP-22c55e?style=flat-square" />
+  <a href="https://github.com/tianrking/oh_myserial"><img alt="GitHub" src="https://img.shields.io/badge/github-tianrking%2Foh__myserial-181717?style=flat-square&logo=github" /></a>
+</p>
+
+<p align="center">
+  <img alt="serial" src="https://img.shields.io/badge/serial-UART%20%2F%20COM%20%2F%20tty-0ea5e9?style=flat-square" />
+  <img alt="hub" src="https://img.shields.io/badge/hub-mux%20%2F%20share-8b5cf6?style=flat-square" />
+  <img alt="websocket" src="https://img.shields.io/badge/API-HTTP%20%2B%20WebSocket-06b6d4?style=flat-square" />
+  <img alt="agent" src="https://img.shields.io/badge/AI-agent%20friendly-f59e0b?style=flat-square" />
+  <img alt="embedded" src="https://img.shields.io/badge/domain-embedded%20debug-64748b?style=flat-square" />
+  <img alt="tokio" src="https://img.shields.io/badge/async-tokio-c026d3?style=flat-square" />
+  <img alt="axum" src="https://img.shields.io/badge/web-axum-7c3aed?style=flat-square" />
+  <img alt="pty" src="https://img.shields.io/badge/Unix-PTY-14b8a6?style=flat-square" />
+  <img alt="tcp" src="https://img.shields.io/badge/stream-TCP-3b82f6?style=flat-square" />
+  <img alt="toml" src="https://img.shields.io/badge/config-TOML-e11d48?style=flat-square" />
 </p>
 
 ---
 
-## Why ohmyserial?
+## Table of contents
 
-A hardware serial port can only be opened by **one process**. That breaks the modern debug loop:
-
-| You want… | But… |
-|-----------|------|
-| A classic serial terminal / host app open | The port is already taken |
-| An AI agent / script reading the same log | Can’t open the same COM/tty |
-| Both sending commands safely | Bytes interleave and protocols break |
-
-**ohmyserial** solves this by **exclusively owning the real port**, then:
-
-1. **Broadcasting RX** to every client  
-2. **Arbitrating TX** so writers don’t silently corrupt the stream  
-3. Offering **dual access**: virtual serial (Unix) + TCP / HTTP / WebSocket (all platforms, agent-friendly)
-
-> Deep product & architecture notes: [`POSITIONING.md`](./POSITIONING.md)
+- [What is ohmyserial?](#what-is-ohmyserial)
+- [Problem & solution](#problem--solution)
+- [Features](#features)
+- [How it works](#how-it-works)
+- [Platform support](#platform-support)
+- [Install & build](#install--build)
+- [Quick start](#quick-start)
+- [How to use (scenarios)](#how-to-use-scenarios)
+- [Configuration](#configuration)
+- [CLI reference](#cli-reference)
+- [HTTP & WebSocket API](#http--websocket-api)
+- [TX policies](#tx-policies)
+- [Unix PTY](#unix-pty-macos--linux)
+- [Windows notes](#windows-notes)
+- [Security](#security)
+- [Project structure](#project-structure)
+- [Development](#development)
+- [Roadmap](#roadmap)
+- [FAQ](#faq)
+- [Contributing](#contributing)
+- [License](#license)
+- [Tech tags](#tech-tags)
 
 ---
 
-## Architecture
+## What is ohmyserial?
+
+**ohmyserial** is a small, open-source **serial port sharing hub** written in Rust.
+
+It:
+
+1. Opens the **real serial device** once (exclusive ownership)
+2. **Fans out RX** (device → host) to many clients
+3. **Arbitrates TX** (host → device) so concurrent writers do not silently corrupt frames
+4. Exposes clients as **TCP**, **HTTP/WebSocket** (agent-first), and **PTY** (macOS/Linux host tools)
+
+Ideal for embedded debug when **a human terminal and an AI agent/script must share one UART**.
+
+| Item | Value |
+|------|--------|
+| Binary name | `ohmyserial` |
+| Repository | [github.com/tianrking/oh_myserial](https://github.com/tianrking/oh_myserial) |
+| Language | Rust (edition 2021) |
+| License | MIT |
+| Default docs | **English** · [中文](./README.zh-CN.md) · [Español](./README.es.md) |
+| Architecture deep-dive | [`POSITIONING.md`](./POSITIONING.md) |
+
+---
+
+## Problem & solution
+
+### The problem
+
+| Goal | Reality |
+|------|---------|
+| Keep a serial monitor open | Port is busy |
+| Let an agent/script read the same log | Second open fails |
+| Let both send commands | Bytes interleave → broken protocol |
+
+### The solution
 
 ```text
-                    ┌─────────────────────────────────────┐
-                    │            ohmyserial hub           │
-                    │  (single process, owns real port)   │
-                    └──────────────────┬──────────────────┘
-                                       │
-              ┌────────────────────────┼────────────────────────┐
-              │                        │                        │
-              ▼                        ▼                        ▼
-     ┌────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-     │  Serial Core   │      │  Broker         │      │  Observability  │
-     │  open/reconnect│◄────►│  RX fan-out     │─────►│  session log    │
-     │  baud / flow   │      │  TX policy/lock │      │  tracing        │
-     └────────────────┘      └────────┬────────┘      └─────────────────┘
-                                      │
-                 ┌────────────────────┼────────────────────┐
-                 │                    │                    │
-                 ▼                    ▼                    ▼
-          ┌────────────┐       ┌────────────┐       ┌────────────┐
-          │ PTY (Unix) │       │ TCP stream │       │ HTTP + WS  │
-          │ host tools │       │ scripts    │       │ agents     │
-          └────────────┘       └────────────┘       └────────────┘
-```
-
-**Data path**
-
-```text
-Device ──RX──► Hub ──broadcast──► all clients
-Client ──TX──► Hub ──admit/queue/lock──► Device
+Device (UART/COM)
+        │
+        ▼
+   ┌──────────┐
+   │ ohmyserial│  ← only process that opens the real port
+   └────┬─────┘
+        │
+   ┌────┴─────────────────────────────┐
+   ▼                ▼                 ▼
+  PTY            TCP stream      HTTP + WebSocket
+ (host UI)       (scripts)         (agents)
 ```
 
 ---
 
 ## Features
 
-### Core
+### Functional features
 
-| Feature | Description |
-|---------|-------------|
-| **Exclusive real port** | Only the hub opens the hardware UART |
-| **RX fan-out** | Every readable client gets the same device data |
-| **TX arbitration** | Line/frame queue, exclusive mode, primary preference |
-| **Write-lock lease** | Time-bounded ownership for safe multi-writer control |
-| **Auto reconnect** | Optional reopen when the device drops |
-| **Session logging** | Console + file, text / hex / hex+text |
-| **Mock port** | `path = "mock:demo"` loopback without hardware |
+| Feature | Description | Status |
+|---------|-------------|--------|
+| Exclusive real port | Single owner of hardware UART | ✅ |
+| Port parameters | baud, data bits, parity, stop bits, flow control | ✅ |
+| RX fan-out | All readable clients receive device data | ✅ |
+| TX arbitration | Line/frame queue, exclusive, primary preference | ✅ |
+| Write-lock lease | Time-bounded TX ownership | ✅ |
+| Auto reconnect | Optional reopen after disconnect | ✅ |
+| TCP client | Raw bidirectional byte stream | ✅ |
+| HTTP API | health / status / write / lock | ✅ |
+| WebSocket stream | Live RX (+ optional history on connect) | ✅ |
+| Unix PTY | Symlinked virtual serial for classic tools | ✅ (macOS/Linux) |
+| Session log | Console + file; text / hex / hex+text | ✅ |
+| Mock port | `mock:demo` loopback without hardware | ✅ |
+| TOML config + CLI | `run` / `init` / `list-ports` / `status` | ✅ |
+| Multi-port single process | Multiple real profiles in one process | 🔜 |
+| RFC2217 | Telnet serial control over network | 🔜 |
+| Native Windows virtual COM | Kernel/driver-level COM clone | 🔜 / external bridge |
 
-### Clients
+### Technical features
 
-| Client | Platforms | Best for |
-|--------|-----------|----------|
-| **HTTP + WebSocket API** | All | AI agents, automation, status/control |
-| **TCP raw stream** | All | `nc`, scripts, simple tools |
-| **PTY virtual serial** | macOS / Linux | Classic serial terminals & host apps |
+| Area | Stack / design |
+|------|----------------|
+| Runtime | Tokio async |
+| HTTP/WS | Axum |
+| Serial I/O | `serialport` + dedicated reader thread |
+| Config | Serde + TOML |
+| Logging | `tracing` + session blog |
+| Unix PTY | `nix` openpty + symlink |
+| Tests | Unit + integration (mock hub) |
+| CI | GitHub Actions: Ubuntu · macOS · Windows |
 
-### Platform matrix
+---
 
-| | macOS | Linux / Ubuntu | Windows |
-|--|:-----:|:--------------:|:-------:|
-| Real serial | ✅ | ✅ | ✅ |
-| TCP / HTTP / WS | ✅ | ✅ | ✅ |
-| PTY virtual port | ✅ | ✅ | — |
+## How it works
+
+### Data plane
+
+```text
+Device ──RX──► Serial Core ──► Broker.broadcast ──► clients
+Client ──TX──► Broker.admit(policy/lock) ──► Serial Core ──► Device
+```
+
+### Control plane
+
+- `GET /v1/status` — connected?, baud, clients, lock owner, counters  
+- `POST /v1/lock` / `DELETE /v1/lock` — write lease  
+- `POST /v1/write` — inject TX as a named client  
+
+### Architecture modules
+
+```text
+CLI / Config
+    └── Hub supervisor
+            ├── Serial core (open, reconnect, mock)
+            ├── Broker (registry, fan-out, TX queue)
+            ├── Policy (queue_by_line / exclusive / …)
+            ├── Clients: PTY · TCP · HTTP/WS
+            └── Observe (session log, tracing)
+```
+
+---
+
+## Platform support
+
+| Capability | macOS | Linux / Ubuntu | Windows |
+|------------|:-----:|:--------------:|:-------:|
+| Real serial (`/dev/cu.*`, `/dev/ttyUSB*`, `COM3`) | ✅ | ✅ | ✅ |
+| TCP raw stream | ✅ | ✅ | ✅ |
+| HTTP + WebSocket API | ✅ | ✅ | ✅ |
+| PTY virtual serial | ✅ | ✅ | — |
 | Mock loopback | ✅ | ✅ | ✅ |
-| Native virtual COM | — | — | planned* |
+| Architectures | arm64 / x64 | x64 / arm64 | x64 / arm64 |
 
-\* Windows COM-only host apps: use TCP/WS today, or bridge later (e.g. com0com). See [Windows notes](#windows-notes).
+**Ubuntu tip:** install `build-essential pkg-config libudev-dev` before building.
+
+**Windows tip:** apps that only list COM ports need TCP/WS or an external COM bridge; PTY is Unix-only.
 
 ---
 
@@ -113,18 +213,18 @@ Client ──TX──► Hub ──admit/queue/lock──► Device
 
 ### Requirements
 
-- [Rust](https://rustup.rs/) stable (1.70+ recommended)
-- **Ubuntu / Debian:**
+- [Rust](https://rustup.rs/) stable  
+- **Ubuntu/Debian:**
 
   ```bash
   sudo apt update
   sudo apt install -y build-essential pkg-config libudev-dev
   ```
 
-- **Windows:** MSVC toolchain (`rustup default stable-msvc`) or MinGW as preferred  
-- **macOS:** Xcode CLT usually enough
+- **macOS:** Xcode Command Line Tools  
+- **Windows:** MSVC toolchain via rustup  
 
-### From source
+### Build from source
 
 ```bash
 git clone https://github.com/tianrking/oh_myserial.git
@@ -132,8 +232,10 @@ cd oh_myserial
 cargo build --release
 ```
 
-Binary: `./target/release/ohmyserial`  
-(Windows: `.\target\release\ohmyserial.exe`)
+| OS | Binary |
+|----|--------|
+| Unix | `./target/release/ohmyserial` |
+| Windows | `.\target\release\ohmyserial.exe` |
 
 ### Verify
 
@@ -144,55 +246,47 @@ cargo test
 
 ---
 
-## Quick start (2 minutes)
+## Quick start
 
-### 1. Create a config
+### 1) Create config
 
 ```bash
 ./target/release/ohmyserial init -o ohmyserial.toml
 ```
 
-Default sample uses **`mock:demo`** (no hardware).
+Default sample uses **`path = "mock:demo"`** (no hardware required).
 
-### 2. Run the hub
+### 2) Run hub
 
 ```bash
 ./target/release/ohmyserial run -c ohmyserial.toml
 ```
 
-You should see the API on `http://127.0.0.1:8787` and TCP on `127.0.0.1:8788`.
+Defaults:
 
-### 3. Talk to it
+| Service | Address |
+|---------|---------|
+| HTTP / WebSocket API | `http://127.0.0.1:8787` · `ws://127.0.0.1:8787/v1/stream` |
+| TCP stream | `127.0.0.1:8788` |
+
+### 3) Try the API
 
 ```bash
-# health
 curl -s http://127.0.0.1:8787/v1/health
-
-# send a line (mock loops it back as RX)
 curl -s -X POST http://127.0.0.1:8787/v1/write \
   -H 'content-type: application/json' \
   -d '{"text":"hello","newline":true}'
-
-# raw TCP
-nc 127.0.0.1 8788
 ```
 
-### 4. Attach real hardware
-
-Edit `ohmyserial.toml`:
+### 4) Attach real hardware
 
 ```toml
 [real]
-# macOS example
-path = "/dev/cu.usbmodem14101"
-# Linux example
-# path = "/dev/ttyUSB0"
-# Windows example
-# path = "COM3"
+path = "/dev/cu.usbmodem14101"   # macOS
+# path = "/dev/ttyUSB0"          # Linux
+# path = "COM3"                  # Windows
 baud = 115200
 ```
-
-List ports:
 
 ```bash
 ./target/release/ohmyserial list-ports
@@ -200,67 +294,76 @@ List ports:
 
 ---
 
-## Usage patterns
+## How to use (scenarios)
 
-### A. Human + Agent (recommended)
+### Scenario A — Human + AI agent (recommended)
+
+1. Start hub on the real port.  
+2. Open Unix PTY (or TCP) in your serial GUI.  
+3. Point the agent at WebSocket RX + HTTP write.  
 
 ```text
-┌──────────────┐     PTY / TCP      ┌────────────┐
-│ Serial app   │◄──────────────────►│            │
-└──────────────┘                    │ ohmyserial │◄──► Device
-┌──────────────┐   WS + HTTP API    │            │
-│ AI Agent     │◄──────────────────►│            │
-└──────────────┘                    └────────────┘
+Serial app ──PTY/TCP──► ohmyserial ──► Device
+Agent      ──WS/HTTP──►     ▲
 ```
 
-- **Human:** Unix PTY (`/tmp/ohmyserial-ui`) or TCP  
-- **Agent:** `WS /v1/stream` for logs + `POST /v1/write` for commands  
+### Scenario B — Scripts / CI only
 
-### B. Scripts only
+Enable TCP + API; skip PTY. Use `nc`, Python, or CI jobs against `8787`/`8788`.
 
-Enable TCP + API; skip PTY. Pipe with `nc`, Python, or CI jobs.
+### Scenario C — Demo without hardware
 
-### C. No hardware / CI
+Keep `path = "mock:demo"`. Writes loop back as RX (great for tests).
 
-Keep `path = "mock:demo"` for loopback demos and automated tests.
+### Scenario D — Agent-only write with lock
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/v1/lock \
+  -H 'content-type: application/json' \
+  -d '{"as_client":"agent"}'
+# ... exclusive window ...
+curl -s -X DELETE http://127.0.0.1:8787/v1/lock
+```
 
 ---
 
 ## Configuration
 
-Full example: [`ohmyserial.example.toml`](./ohmyserial.example.toml)
-
-Generate one anytime:
-
-```bash
-ohmyserial init -o ohmyserial.toml
-```
-
-### Important sections
+Example file: [`ohmyserial.example.toml`](./ohmyserial.example.toml)
 
 ```toml
 [real]
-path = "mock:demo"          # or /dev/ttyUSB0, COM3, …
+path = "mock:demo"
 baud = 115200
+databits = 8
+parity = "none"
+stopbits = 1
+flow = "none"
 reconnect = true
+reconnect_ms = 1000
 
 [tx]
-mode = "queue_by_line"      # see TX policies below
-write_lock_ms = 3000
+mode = "queue_by_line"     # queue_by_line | queue_by_frame | exclusive | primary_wins
 primary = "ui"
+write_lock_ms = 3000
+slow_client = "drop_oldest"
 
 [api]
-bind = "127.0.0.1:8787"     # default: localhost only
+bind = "127.0.0.1:8787"
 enabled = true
 
 [[clients]]
 type = "tcp"
 name = "tcp"
 bind = "127.0.0.1:8788"
+can_write = true
+can_read = true
 
 [[clients]]
 type = "websocket"
 name = "agent"
+can_write = true
+can_read = true
 history_bytes = 65536
 
 # macOS / Linux only
@@ -268,28 +371,33 @@ history_bytes = 65536
 # type = "pty"
 # name = "ui"
 # link = "/tmp/ohmyserial-ui"
+# can_write = true
+# can_read = true
+
+[log]
+# file = "logs/session.blog"
+mirror_console = true
+format = "hex+text"        # text | hex | hex+text
 ```
 
-| Key | Meaning |
-|-----|---------|
-| `real.path` | Device path, or `mock:…` for loopback |
-| `tx.mode` | How concurrent writes are serialized |
+| Field | Meaning |
+|-------|---------|
+| `real.path` | Device path or `mock:name` |
+| `tx.mode` | Concurrent write policy |
 | `tx.write_lock_ms` | Lock lease duration |
-| `api.bind` | HTTP/WS listen address (**prefer 127.0.0.1**) |
-| `clients[].can_write` | Whether that client may TX |
+| `api.bind` | HTTP/WS listen address (prefer localhost) |
+| `clients[].can_read` / `can_write` | Per-client permissions |
 
 ---
 
-## CLI
+## CLI reference
 
 ```bash
-ohmyserial run -c ohmyserial.toml     # start hub
-ohmyserial init [-o file]            # print/write sample config
-ohmyserial list-ports                # enumerate serial devices
-ohmyserial status [--api URL]        # fetch /v1/status from a running hub
+ohmyserial run -c ohmyserial.toml    # start hub
+ohmyserial init [-o file]           # sample config to stdout/file
+ohmyserial list-ports               # list serial devices
+ohmyserial status [--api URL]       # GET /v1/status
 ```
-
-Logging verbosity:
 
 ```bash
 RUST_LOG=debug ohmyserial run -c ohmyserial.toml
@@ -299,22 +407,22 @@ RUST_LOG=debug ohmyserial run -c ohmyserial.toml
 
 ## HTTP & WebSocket API
 
-Base URL (default): `http://127.0.0.1:8787`
+**Base:** `http://127.0.0.1:8787` (default)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/v1/health` | Liveness |
-| `GET` | `/v1/status` | Port state, clients, lock, stats |
-| `GET` | `/v1/clients` | Connected clients |
-| `POST` | `/v1/write` | Send bytes/text to the device |
+| `GET` | `/v1/health` | Liveness JSON |
+| `GET` | `/v1/status` | Port, clients, lock, stats |
+| `GET` | `/v1/clients` | Client list |
+| `POST` | `/v1/write` | Send text or hex to device |
 | `POST` | `/v1/lock` | Acquire write lock |
 | `DELETE` | `/v1/lock` | Release write lock |
-| `WS` | `/v1/stream` | Binary/text RX stream (+ optional history) |
+| `WS` | `/v1/stream` | Live RX stream |
 
-### Write body
+### Write
 
 ```bash
-# text (appends \n by default)
+# text (newline appended by default)
 curl -s -X POST http://127.0.0.1:8787/v1/write \
   -H 'content-type: application/json' \
   -d '{"text":"AT","newline":true,"as_client":"agent"}'
@@ -325,31 +433,26 @@ curl -s -X POST http://127.0.0.1:8787/v1/write \
   -d '{"hex":"41 54 0d 0a","as_client":"agent"}'
 ```
 
-### Lock
-
-```bash
-curl -s -X POST http://127.0.0.1:8787/v1/lock \
-  -H 'content-type: application/json' \
-  -d '{"as_client":"agent"}'
-
-curl -s -X DELETE http://127.0.0.1:8787/v1/lock
-```
-
 ### WebSocket
 
 ```text
 ws://127.0.0.1:8787/v1/stream
 ```
 
-- Server → client: binary frames (device RX), history on connect when configured  
-- Client → server: text or binary becomes TX (subject to policy / lock)
+- Server → client: binary RX (history may be sent first)  
+- Client → server: text/binary TX (policy + lock apply)
 
-### Example: Python agent sketch
+### TCP
+
+```bash
+nc 127.0.0.1 8788
+```
+
+### Minimal Python agent
 
 ```python
-import json, urllib.request, websocket  # pip install websocket-client
+import json, urllib.request
 
-# write a command
 req = urllib.request.Request(
     "http://127.0.0.1:8787/v1/write",
     data=json.dumps({"text": "status", "newline": True}).encode(),
@@ -357,34 +460,26 @@ req = urllib.request.Request(
     method="POST",
 )
 print(urllib.request.urlopen(req).read().decode())
-
-# stream RX
-ws = websocket.create_connection("ws://127.0.0.1:8787/v1/stream")
-while True:
-    print(ws.recv())
 ```
 
 ---
 
 ## TX policies
 
-| Mode | Behavior | When to use |
+| Mode | Behavior | Typical use |
 |------|----------|-------------|
-| `queue_by_line` **(default)** | Buffer until `\n`, then send whole line | Text / AT / CLI devices |
-| `queue_by_frame` | Buffer until delimiter byte | Simple framed binary |
-| `exclusive` | Must hold write lock to TX | Flash / dangerous sessions |
-| `primary_wins` | Prefer configured `primary` client | Human-in-the-loop priority |
+| `queue_by_line` **(default)** | Wait for `\n`, then send whole line | Text / AT / CLI |
+| `queue_by_frame` | Wait for delimiter byte | Simple binary frames |
+| `exclusive` | TX only with active write lock | Flash / critical ops |
+| `primary_wins` | Prefer `tx.primary` client | Human-in-the-loop |
 
-**Write lock** (any mode): while held, only the lock owner may TX.  
-Lease expires after `write_lock_ms`, or on client disconnect / explicit release.
+While a **write lock** is held, only the owner may TX. Lease ends on timeout, release, or disconnect.
 
-**Slow clients** (`tx.slow_client`): `drop_oldest` (default) keeps the real port realtime; never block the device reader.
+`slow_client = drop_oldest` (default) protects real-time device reading.
 
 ---
 
 ## Unix PTY (macOS / Linux)
-
-Enable in config:
 
 ```toml
 [[clients]]
@@ -395,51 +490,53 @@ can_write = true
 can_read = true
 ```
 
-Then open `/tmp/ohmyserial-ui` in your favorite terminal (minicom, screen, Serial Studio, …).
+Open `/tmp/ohmyserial-ui` in minicom, screen, Serial Studio, etc.
 
-> Real baud rate / framing come from the hub `[real]` section.  
-> Some apps may fail ioctl baud on PTY — that’s a host-tool limitation; data path still works.
+> Real baud/framing is owned by the hub `[real]` section. Some apps may fail PTY baud ioctls; the data path still works.
 
 ---
 
 ## Windows notes
 
-| You need | Use |
-|----------|-----|
-| Agent / scripts | HTTP + WebSocket ✅ |
+| Need | Use |
+|------|-----|
+| Agent / automation | HTTP + WebSocket ✅ |
 | Simple stream | TCP `127.0.0.1:8788` ✅ |
-| Real device | `path = "COM3"` ✅ |
-| App that **only** lists COM ports | Not built-in yet — use TCP if possible, or external COM bridge (com0com, etc.) |
-
-`type = "pty"` is rejected on Windows by design (no Unix PTY).
+| Hardware | `path = "COM3"` ✅ |
+| COM-only legacy UI | External bridge (e.g. com0com) — not built-in yet |
+| `type = "pty"` | Not supported (config rejected) |
 
 ---
 
 ## Security
 
-- Default binds are **`127.0.0.1`** — writing the serial port is equivalent to touching hardware.
-- Do **not** expose `0.0.0.0` on untrusted networks without auth (auth is not in MVP).
-- Session logs may contain secrets from the device stream — treat log files carefully.
+- Default binds are **localhost only** (`127.0.0.1`)  
+- Serial TX can reset boards / send dangerous commands — treat as privileged  
+- Do not bind `0.0.0.0` on untrusted networks without auth (auth is post-MVP)  
+- Logs may contain secrets from the device stream  
 
 ---
 
-## Project layout
+## Project structure
 
 ```text
 oh_myserial/
-├── POSITIONING.md          # product & architecture SSOT
-├── ohmyserial.example.toml # sample config
+├── README.md                 # English (default)
+├── README.zh-CN.md           # 简体中文
+├── README.es.md              # Español
+├── POSITIONING.md            # product & architecture SSOT
+├── ohmyserial.example.toml
+├── LICENSE
 ├── src/
-│   ├── main.rs             # CLI
-│   ├── lib.rs
-│   ├── hub.rs              # wiring
-│   ├── broker.rs           # RX fan-out / TX admit
-│   ├── serial.rs           # real + mock port
-│   ├── policy.rs           # TX modes & locks
-│   ├── config.rs           # TOML schema
-│   ├── observe.rs          # session log
-│   └── client/             # tcp, http/ws, pty
-└── tests/                  # integration tests
+│   ├── main.rs               # CLI
+│   ├── hub.rs                # wiring
+│   ├── broker.rs             # fan-out / TX admit
+│   ├── serial.rs             # real + mock
+│   ├── policy.rs
+│   ├── config.rs
+│   ├── observe.rs
+│   └── client/               # tcp · api · pty
+└── tests/
 ```
 
 ---
@@ -447,55 +544,52 @@ oh_myserial/
 ## Development
 
 ```bash
-# unit + integration tests
 cargo test
-
-# run example mock hub
 cargo run -- run -c ohmyserial.example.toml
-
-# format / lint (optional)
 cargo fmt
 cargo clippy
 ```
 
-CI builds/tests on **Ubuntu, macOS, and Windows** (see [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)).
+CI: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) — Ubuntu, macOS, Windows.
 
 ---
 
 ## Roadmap
 
-| Phase | Focus |
+| Phase | Scope |
 |-------|--------|
-| ✅ MVP | Hub core, TX policy, TCP, HTTP/WS, Unix PTY, mock, logs, CLI |
-| 🔜 Next | Multi-port profiles, richer history, Windows COM bridge docs, hardening |
-| 🧭 Later | RFC2217, record/replay, light web monitor, metrics export |
+| ✅ MVP | Hub core, policies, TCP, HTTP/WS, Unix PTY, mock, logs, CLI |
+| 🔜 Next | Multi-port, richer history, Windows COM bridge guide, hardening |
+| 🧭 Later | RFC2217, record/replay, light web monitor, metrics |
 
-Not planned as core: proprietary GUI suite, cloud accounts, kernel virtual-COM driver (unless demand is clear).
+Not core goals: cloud SaaS, heavy GUI installer, kernel virtual-COM driver (unless demand is clear).
 
 ---
 
 ## FAQ
 
-**Q: Can two writers send at the same time?**  
-A: Bytes are never silently interleaved. Default mode queues **complete lines**; locks can grant exclusive windows.
+**Can two clients write at once?**  
+Not as interleaved bytes. Default mode queues complete lines; locks grant exclusive windows.
 
-**Q: Does the agent need a virtual COM port?**  
-A: No. Prefer WebSocket + HTTP — more reliable for automation.
+**Must the agent use a virtual COM port?**  
+No. Prefer WebSocket + HTTP.
 
-**Q: Why is my host app’s baud setting ignored on PTY?**  
-A: The real port is configured by the hub. PTY is a software endpoint.
+**Why does my terminal’s baud setting on PTY not change the device?**  
+The hub owns the real port settings.
 
-**Q: Is this a serial sniffer?**  
-A: It can log traffic, but the primary goal is **shared interactive access**, not passive capture only.
+**Is this only a sniffer?**  
+No. It is an interactive **share hub** with TX control, not passive capture only.
+
+**Does mock mode need hardware?**  
+No. `mock:demo` loops TX back as RX.
 
 ---
 
 ## Contributing
 
-Issues and PRs welcome:  
-https://github.com/tianrking/oh_myserial
+Issues & PRs: https://github.com/tianrking/oh_myserial  
 
-Please keep changes aligned with [`POSITIONING.md`](./POSITIONING.md) (small, cross-platform, agent-friendly).
+Please stay aligned with [`POSITIONING.md`](./POSITIONING.md).
 
 ---
 
@@ -505,6 +599,16 @@ Please keep changes aligned with [`POSITIONING.md`](./POSITIONING.md) (small, cr
 
 ---
 
+## Tech tags
+
+`serial` · `uart` · `com-port` · `tty` · `serial-hub` · `serial-mux` · `port-sharing` · `embedded` · `debugging` · `ai-agent` · `websocket` · `http-api` · `tcp` · `pty` · `tokio` · `axum` · `rust` · `cross-platform` · `macos` · `linux` · `windows` · `toml` · `mit-license` · `ohmyserial`
+
+---
+
 <p align="center">
+  <a href="./README.md">English</a> ·
+  <a href="./README.zh-CN.md">简体中文</a> ·
+  <a href="./README.es.md">Español</a>
+  <br/>
   <sub>One port. Many clients. Zero fights.</sub>
 </p>
