@@ -1,1 +1,6 @@
 /target
+web/node_modules
+web/dist
+.DS_Store
+*.blog
+logs/

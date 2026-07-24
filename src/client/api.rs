@@ -11,6 +11,7 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::broker::{Broker, WriteLockView};
@@ -25,6 +26,12 @@ pub struct ApiState {
 
 pub fn spawn_api_server(state: ApiState, bind: String) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // CORS: allow local Vite/Vercel static UIs to call this hub.
+        let cors = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any);
+
         let app = Router::new()
             .route("/v1/health", get(health))
             .route("/v1/status", get(status))
@@ -34,6 +41,7 @@ pub fn spawn_api_server(state: ApiState, bind: String) -> tokio::task::JoinHandl
             .route("/v1/lock", post(lock).delete(unlock))
             // Unlimited concurrent agents/monitors share the same stream path.
             .route("/v1/stream", get(ws_stream))
+            .layer(cors)
             .layer(TraceLayer::new_for_http())
             .with_state(Arc::new(state));
 

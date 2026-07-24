@@ -1,0 +1,6 @@
+/* 全域基底由 App.css 處理 */
+html,
+body,
+#root {
+  min-height: 100%;
+}

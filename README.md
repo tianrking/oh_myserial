@@ -550,22 +550,29 @@ Open `/tmp/ohmyserial-ui` in minicom, screen, Serial Studio, etc.
 ```text
 oh_myserial/
 ├── README.md                 # English (default)
-├── README.zh-CN.md           # 简体中文
-├── README.es.md              # Español
-├── POSITIONING.md            # product & architecture SSOT
+├── README.zh-CN.md
+├── README.es.md
+├── POSITIONING.md
 ├── ohmyserial.example.toml
-├── LICENSE
-├── src/
-│   ├── main.rs               # CLI
-│   ├── hub.rs                # wiring
-│   ├── broker.rs             # fan-out / TX admit
-│   ├── serial.rs             # real + mock
-│   ├── policy.rs
-│   ├── config.rs
-│   ├── observe.rs
-│   └── client/               # tcp · api · pty
+├── web/                      # Optional React console (Traditional Chinese)
+│   ├── PROTOCOL.zh-TW.md     # Full HTTP/WS protocol
+│   ├── README.zh-TW.md
+│   └── src/
+├── src/                      # Rust hub + CLI
 └── tests/
 ```
+
+### Optional web console
+
+```bash
+# terminal 1
+cargo run --release -- share mock:demo
+
+# terminal 2
+cd web && npm install && npm run dev
+```
+
+Open the Vite URL, click **連線**. Protocol: [`web/PROTOCOL.zh-TW.md`](./web/PROTOCOL.zh-TW.md).
 
 ---
 
