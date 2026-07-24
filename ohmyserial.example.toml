@@ -1,0 +1,49 @@
+# oh_myserial example config
+# Real port: device path, or "mock:demo" for hardware-free loopback.
+
+[real]
+path = "mock:demo"
+baud = 115200
+databits = 8
+parity = "none"
+stopbits = 1
+flow = "none"
+reconnect = true
+reconnect_ms = 1000
+
+[tx]
+mode = "queue_by_line"   # queue_by_line | queue_by_frame | exclusive | primary_wins
+primary = "ui"
+write_lock_ms = 3000
+slow_client = "drop_oldest"
+
+[api]
+bind = "127.0.0.1:8787"
+enabled = true
+
+[[clients]]
+type = "tcp"
+name = "tcp"
+bind = "127.0.0.1:8788"
+can_write = true
+can_read = true
+
+[[clients]]
+type = "websocket"
+name = "agent"
+can_write = true
+can_read = true
+history_bytes = 65536
+
+# Unix only (macOS/Linux) — traditional host tools open this path:
+# [[clients]]
+# type = "pty"
+# name = "ui"
+# link = "/tmp/ohmyserial-ui"
+# can_write = true
+# can_read = true
+
+[log]
+# file = "logs/session.blog"
+mirror_console = true
+format = "hex+text"
