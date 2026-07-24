@@ -29,8 +29,10 @@ pub fn spawn_api_server(state: ApiState, bind: String) -> tokio::task::JoinHandl
             .route("/v1/health", get(health))
             .route("/v1/status", get(status))
             .route("/v1/clients", get(clients))
+            .route("/v1/endpoints", get(endpoints))
             .route("/v1/write", post(write))
             .route("/v1/lock", post(lock).delete(unlock))
+            // Unlimited concurrent agents/monitors share the same stream path.
             .route("/v1/stream", get(ws_stream))
             .layer(TraceLayer::new_for_http())
             .with_state(Arc::new(state));
@@ -68,6 +70,16 @@ async fn status(State(st): State<Arc<ApiState>>) -> impl IntoResponse {
 async fn clients(State(st): State<Arc<ApiState>>) -> impl IntoResponse {
     let snap = st.broker.snapshot();
     Json(snap.clients)
+}
+
+/// List configured fan-out endpoints (virtual serial, TCP, WS, HTTP).
+async fn endpoints(State(st): State<Arc<ApiState>>) -> impl IntoResponse {
+    let snap = st.broker.snapshot();
+    Json(serde_json::json!({
+        "real": snap.port,
+        "endpoints": snap.endpoints,
+        "connected_clients": snap.clients.len(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,9 +198,11 @@ async fn ws_stream(
 
 async fn handle_ws(socket: WebSocket, st: Arc<ApiState>) {
     let (mut sink, mut stream) = socket.split();
+    // Each WebSocket connection is an independent fan-out subscriber.
+    let conn_name = format!("ws-{}", uuid::Uuid::new_v4());
     let (id, mut from_broker) =
         st.broker
-            .register_client("agent-ws", "websocket", true, true, None);
+            .register_client(conn_name, "websocket", true, true, None);
 
     // Send history first (binary).
     if st.history_on_ws_connect > 0 {

@@ -1,8 +1,15 @@
-# oh_myserial example config
-# Real port: device path, or "mock:demo" for hardware-free loopback.
+# oh_myserial example — ONE real UART, MANY parallel consumers
+#
+# mental model:
+#   real serial ──► hub ──┬── virtual serial (PTY) × N   → classic host tools
+#                         ├── TCP :port × M              → many nc/scripts per port
+#                         └── WebSocket /v1/stream × ∞   → many agents at once
 
 [real]
 path = "mock:demo"
+# path = "/dev/cu.usbmodem14101"   # macOS
+# path = "/dev/ttyUSB0"            # Linux
+# path = "COM3"                    # Windows
 baud = 115200
 databits = 8
 parity = "none"
@@ -12,7 +19,7 @@ reconnect = true
 reconnect_ms = 1000
 
 [tx]
-mode = "queue_by_line"   # queue_by_line | queue_by_frame | exclusive | primary_wins
+mode = "queue_by_line"
 primary = "ui"
 write_lock_ms = 3000
 slow_client = "drop_oldest"
@@ -20,22 +27,32 @@ slow_client = "drop_oldest"
 [api]
 bind = "127.0.0.1:8787"
 enabled = true
+# Agents: ws://127.0.0.1:8787/v1/stream  (unlimited concurrent connections)
+# List endpoints: GET http://127.0.0.1:8787/v1/endpoints
 
-[[clients]]
-type = "tcp"
-name = "tcp"
-bind = "127.0.0.1:8788"
-can_write = true
-can_read = true
+# ========== bulk fan-out ==========
+[fanout]
+# macOS / Linux only: set to 2+ to create /tmp/ohmyserial-v0, v1, …
+# (each GUI / program opens its own virtual serial)
+# Windows: keep 0 and use TCP + WebSocket below.
+pty_count = 0
+pty_link_prefix = "/tmp/ohmyserial-v"
+pty_name_prefix = "v"
+pty_can_write = true
+pty_can_read = true
 
-[[clients]]
-type = "websocket"
-name = "agent"
-can_write = true
-can_read = true
-history_bytes = 65536
+# Two TCP ports; EACH accepts many simultaneous clients (all see the same RX)
+tcp_count = 2
+tcp_host = "127.0.0.1"
+tcp_base_port = 8788
+tcp_name_prefix = "tcp"
+tcp_can_write = true
+tcp_can_read = true
 
-# Unix only (macOS/Linux) — traditional host tools open this path:
+# Optional second API/WS server:
+# ws_binds = ["127.0.0.1:8790"]
+
+# ========== explicit extras (optional) ==========
 # [[clients]]
 # type = "pty"
 # name = "ui"
@@ -44,6 +61,5 @@ history_bytes = 65536
 # can_read = true
 
 [log]
-# file = "logs/session.blog"
 mirror_console = true
 format = "hex+text"

@@ -129,8 +129,10 @@ async fn simple_http_get(url: &str) -> anyhow::Result<String> {
 }
 
 fn sample_config() -> String {
-    r#"# oh_myserial sample config
-# Real port: use a device path, or "mock:demo" for loopback without hardware.
+    r#"# oh_myserial — one real serial port, many parallel monitors / agents
+#
+# Real port: device path, or "mock:demo" for loopback without hardware.
+# Fan-out: every RX byte is broadcast; TX is arbitrated (see [tx]).
 
 [real]
 path = "mock:demo"
@@ -148,32 +150,52 @@ primary = "ui"
 write_lock_ms = 3000
 slow_client = "drop_oldest"
 
+# Primary HTTP + WebSocket API (many agents can open /v1/stream at once)
 [api]
 bind = "127.0.0.1:8787"
 enabled = true
 
-[[clients]]
-type = "tcp"
-name = "tcp"
-bind = "127.0.0.1:8788"
-can_write = true
-can_read = true
+# ---- Bulk fan-out (recommended): 1 real → N virtual / network endpoints ----
+[fanout]
+# Unix virtual serial (macOS/Linux only). Set >0 to create /tmp/ohmyserial-v0, v1, …
+# Open each path in a different serial monitor. Windows: leave 0, use TCP/WS.
+pty_count = 0
+pty_link_prefix = "/tmp/ohmyserial-v"
+pty_name_prefix = "v"
+pty_can_write = true
+pty_can_read = true
 
-[[clients]]
-type = "websocket"
-name = "agent"
-# uses [api].bind for WS /v1/stream
-can_write = true
-can_read = true
-history_bytes = 65536
+# TCP listeners: each port accepts MANY concurrent clients (all get full RX).
+# Example: 2 ports → 8788 and 8789; any number of programs may connect to each.
+tcp_count = 2
+tcp_host = "127.0.0.1"
+tcp_base_port = 8788
+tcp_name_prefix = "tcp"
+tcp_can_write = true
+tcp_can_read = true
 
-# Unix only (macOS/Linux): virtual serial for traditional host tools
+# Extra dedicated HTTP/WS servers (optional; primary [api] already multi-client)
+# ws_binds = ["127.0.0.1:8790"]
+# ws_name_prefix = "ws"
+# ws_history_bytes = 65536
+
+# ---- Or declare endpoints one-by-one (merged with [fanout]) ----
 # [[clients]]
 # type = "pty"
 # name = "ui"
 # link = "/tmp/ohmyserial-ui"
 # can_write = true
 # can_read = true
+#
+# [[clients]]
+# type = "tcp"
+# name = "script"
+# bind = "127.0.0.1:8800"
+#
+# [[clients]]
+# type = "websocket"
+# name = "agent"
+# history_bytes = 65536
 
 [log]
 # file = "logs/session.blog"

@@ -39,7 +39,8 @@ mirror_console = false
 format = "text"
 "#
     );
-    let cfg: Config = toml::from_str(&toml).expect("parse");
+    let mut cfg: Config = toml::from_str(&toml).expect("parse");
+    cfg.expand_fanout().expect("expand");
     cfg.validate().expect("validate");
     cfg
 }
@@ -158,6 +159,75 @@ async fn write_lock_blocks_other_client_name() {
     )
     .await;
     assert!(ok.contains("true"), "ok={ok}");
+
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn multi_tcp_clients_all_receive_rx() {
+    // One real mock port → one TCP bind → many concurrent TCP clients all get RX.
+    let api_port = free_port().await;
+    let tcp_port = free_port().await;
+    let toml = format!(
+        r#"
+[real]
+path = "mock:multi"
+
+[tx]
+mode = "queue_by_line"
+
+[api]
+bind = "127.0.0.1:{api_port}"
+enabled = true
+
+[fanout]
+tcp_count = 1
+tcp_host = "127.0.0.1"
+tcp_base_port = {tcp_port}
+tcp_name_prefix = "t"
+
+[log]
+mirror_console = false
+format = "text"
+"#
+    );
+    let mut cfg: Config = toml::from_str(&toml).unwrap();
+    cfg.expand_fanout().unwrap();
+    cfg.validate().unwrap();
+    let handle = hub::run_hub(cfg).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let mut a = TcpStream::connect(format!("127.0.0.1:{tcp_port}"))
+        .await
+        .unwrap();
+    let mut b = TcpStream::connect(format!("127.0.0.1:{tcp_port}"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let _ = http_post_json(
+        &format!("http://127.0.0.1:{api_port}/v1/write"),
+        r#"{"text":"broadcast-all","newline":true}"#,
+    )
+    .await;
+
+    let mut buf_a = vec![0u8; 256];
+    let mut buf_b = vec![0u8; 256];
+    let na = tokio::time::timeout(Duration::from_secs(2), a.read(&mut buf_a))
+        .await
+        .unwrap()
+        .unwrap();
+    let nb = tokio::time::timeout(Duration::from_secs(2), b.read(&mut buf_b))
+        .await
+        .unwrap()
+        .unwrap();
+    let sa = String::from_utf8_lossy(&buf_a[..na]);
+    let sb = String::from_utf8_lossy(&buf_b[..nb]);
+    assert!(sa.contains("broadcast-all"), "a={sa:?}");
+    assert!(sb.contains("broadcast-all"), "b={sb:?}");
+
+    let eps = http_get(&format!("http://127.0.0.1:{api_port}/v1/endpoints")).await;
+    assert!(eps.contains("endpoints"), "eps={eps}");
 
     handle.shutdown();
 }

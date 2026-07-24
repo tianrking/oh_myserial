@@ -287,26 +287,43 @@ baud = 115200
 
 ## Cómo usarlo (escenarios)
 
-### A — Humano + agente de IA (recomendado)
-
-1. Arranca el hub sobre el puerto real.  
-2. Abre PTY (o TCP) en tu app serie.  
-3. Conecta el agente a WebSocket (RX) + HTTP (write).  
+### Idea central: un puerto real → muchos extremos en paralelo
 
 ```text
-App serie ──PTY/TCP──► ohmyserial ──► Dispositivo
-Agente    ──WS/HTTP──►      ▲
+                 ┌─ PTY /tmp/ohmyserial-v0  → GUI serie #1
+                 ├─ PTY /tmp/ohmyserial-v1  → GUI #2 / agente por serie virtual
+ UART real ──► hub ┼─ TCP :8788            → muchos scripts a la vez
+                 ├─ TCP :8789            → más herramientas
+                 └─ WS  /v1/stream        → muchos agentes a la vez
+```
+
+Todos reciben el **mismo RX en vivo**. El TX se arbitra (política/lock).
+
+Usa **`[fanout]`** para crear en bloque, o `[[clients]]` uno a uno.
+
+```bash
+curl -s http://127.0.0.1:8787/v1/endpoints
+```
+
+### A — Varias apps host + agente
+
+```toml
+[fanout]
+pty_count = 2
+pty_link_prefix = "/tmp/ohmyserial-v"
+tcp_count = 1
+tcp_base_port = 8788
 ```
 
 ### B — Solo scripts / CI
 
-TCP + API; sin PTY. Usa `nc`, Python o jobs de CI.
+`tcp_count = 2` + API; sin PTY.
 
 ### C — Demo sin hardware
 
-`path = "mock:demo"`: el TX vuelve como RX.
+`path = "mock:demo"`.
 
-### D — Ventana exclusiva con lock
+### D — Lock exclusivo
 
 ```bash
 curl -s -X POST http://127.0.0.1:8787/v1/lock \

@@ -296,20 +296,46 @@ baud = 115200
 
 ## How to use (scenarios)
 
-### Scenario A — Human + AI agent (recommended)
-
-1. Start hub on the real port.  
-2. Open Unix PTY (or TCP) in your serial GUI.  
-3. Point the agent at WebSocket RX + HTTP write.  
+### Core idea: one real port → many parallel endpoints
 
 ```text
-Serial app ──PTY/TCP──► ohmyserial ──► Device
-Agent      ──WS/HTTP──►     ▲
+                 ┌─ PTY /tmp/ohmyserial-v0  → serial GUI #1
+                 ├─ PTY /tmp/ohmyserial-v1  → serial GUI #2  (or agent via serial lib)
+ Real UART ──► hub ┼─ TCP :8788            → many nc/scripts at once
+                 ├─ TCP :8789            → more tools
+                 └─ WS  /v1/stream        → many agents at once
 ```
+
+All endpoints receive the **same live RX**. TX is shared under policy/lock so writers do not silently interleave.
+
+Configure bulk expansion with **`[fanout]`** (see below), or list individual `[[clients]]`.
+
+Discover live endpoints:
+
+```bash
+curl -s http://127.0.0.1:8787/v1/endpoints | jq .
+```
+
+### Scenario A — Multiple host programs + agent
+
+```toml
+[fanout]
+pty_count = 2                 # macOS/Linux virtual serials
+pty_link_prefix = "/tmp/ohmyserial-v"
+tcp_count = 1
+tcp_base_port = 8788
+
+[api]
+bind = "127.0.0.1:8787"
+```
+
+- Open `/tmp/ohmyserial-v0` and `/tmp/ohmyserial-v1` in two serial apps  
+- Agent connects to `ws://127.0.0.1:8787/v1/stream` (many agents OK)  
+- Scripts: `nc 127.0.0.1 8788` (many connections OK)
 
 ### Scenario B — Scripts / CI only
 
-Enable TCP + API; skip PTY. Use `nc`, Python, or CI jobs against `8787`/`8788`.
+`[fanout] tcp_count = 2` + API; skip PTY. Use `nc`, Python, or CI against `8787`/`8788`/`8789`.
 
 ### Scenario C — Demo without hardware
 
@@ -331,62 +357,59 @@ curl -s -X DELETE http://127.0.0.1:8787/v1/lock
 
 Example file: [`ohmyserial.example.toml`](./ohmyserial.example.toml)
 
+```bash
+ohmyserial init -o ohmyserial.toml
+```
+
+### Bulk fan-out `[fanout]`
+
+| Field | Effect |
+|-------|--------|
+| `pty_count` | N Unix virtual serials (`{prefix}0` …) for multiple serial GUIs |
+| `tcp_count` + `tcp_base_port` | N TCP listeners; **each** accepts many concurrent clients |
+| `ws_binds` | Extra HTTP/WS servers (primary `[api]` already multi-client) |
+
 ```toml
 [real]
-path = "mock:demo"
+path = "mock:demo"          # or /dev/ttyUSB0, COM3, …
 baud = 115200
-databits = 8
-parity = "none"
-stopbits = 1
-flow = "none"
 reconnect = true
-reconnect_ms = 1000
 
 [tx]
-mode = "queue_by_line"     # queue_by_line | queue_by_frame | exclusive | primary_wins
-primary = "ui"
+mode = "queue_by_line"
 write_lock_ms = 3000
-slow_client = "drop_oldest"
+primary = "ui"
 
 [api]
 bind = "127.0.0.1:8787"
 enabled = true
 
-[[clients]]
-type = "tcp"
-name = "tcp"
-bind = "127.0.0.1:8788"
-can_write = true
-can_read = true
+[fanout]
+pty_count = 0               # set 2+ on macOS/Linux for multi serial GUI
+pty_link_prefix = "/tmp/ohmyserial-v"
+tcp_count = 2
+tcp_host = "127.0.0.1"
+tcp_base_port = 8788
+# ws_binds = ["127.0.0.1:8790"]
 
-[[clients]]
-type = "websocket"
-name = "agent"
-can_write = true
-can_read = true
-history_bytes = 65536
-
-# macOS / Linux only
+# Optional explicit endpoints (merged with fanout):
 # [[clients]]
 # type = "pty"
 # name = "ui"
 # link = "/tmp/ohmyserial-ui"
-# can_write = true
-# can_read = true
 
 [log]
-# file = "logs/session.blog"
 mirror_console = true
-format = "hex+text"        # text | hex | hex+text
+format = "hex+text"
 ```
 
 | Field | Meaning |
 |-------|---------|
 | `real.path` | Device path or `mock:name` |
 | `tx.mode` | Concurrent write policy |
-| `tx.write_lock_ms` | Lock lease duration |
-| `api.bind` | HTTP/WS listen address (prefer localhost) |
-| `clients[].can_read` / `can_write` | Per-client permissions |
+| `fanout.*` | Auto-create many parallel endpoints |
+| `api.bind` | HTTP/WS (prefer localhost); unlimited WS clients on `/v1/stream` |
+| `clients[]` | Explicit endpoints (optional) |
 
 ---
 
@@ -412,8 +435,9 @@ RUST_LOG=debug ohmyserial run -c ohmyserial.toml
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1/health` | Liveness JSON |
-| `GET` | `/v1/status` | Port, clients, lock, stats |
-| `GET` | `/v1/clients` | Client list |
+| `GET` | `/v1/status` | Port, endpoints, clients, lock, stats |
+| `GET` | `/v1/endpoints` | Configured fan-out endpoints catalog |
+| `GET` | `/v1/clients` | Connected client list |
 | `POST` | `/v1/write` | Send text or hex to device |
 | `POST` | `/v1/lock` | Acquire write lock |
 | `DELETE` | `/v1/lock` | Release write lock |

@@ -54,8 +54,20 @@ pub struct StatusSnapshot {
     pub tx_mode: String,
     pub lock_owner: Option<String>,
     pub lock_expires_ms: Option<u64>,
+    /// Configured fan-out endpoints (PTY / TCP / WS / HTTP).
+    pub endpoints: Vec<EndpointView>,
     pub clients: Vec<ClientView>,
     pub stats: StatsView,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EndpointView {
+    pub kind: String,
+    pub name: String,
+    pub address: String,
+    pub can_read: bool,
+    pub can_write: bool,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -97,6 +109,7 @@ struct BrokerState {
     port: PortStatus,
     history: VecDeque<u8>,
     history_cap: usize,
+    endpoints: Vec<EndpointView>,
     rx_bytes: AtomicU64,
     tx_bytes: AtomicU64,
     rx_drops: AtomicU64,
@@ -142,6 +155,7 @@ impl Broker {
             port,
             history: VecDeque::with_capacity(history_cap.min(1024)),
             history_cap,
+            endpoints: Vec::new(),
             rx_bytes: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
             rx_drops: AtomicU64::new(0),
@@ -175,6 +189,12 @@ impl Broker {
             g.port = status.clone();
         }
         let _ = self.port_watch.send(status);
+    }
+
+    /// Publish configured fan-out endpoints (virtual serial, TCP, WS, …).
+    pub fn set_endpoints(&self, endpoints: Vec<EndpointView>) {
+        let mut g = self.state.lock();
+        g.endpoints = endpoints;
     }
 
     pub fn register_client(
@@ -459,6 +479,7 @@ impl Broker {
             tx_mode: mode.into(),
             lock_owner,
             lock_expires_ms,
+            endpoints: g.endpoints.clone(),
             clients: g
                 .clients
                 .values()

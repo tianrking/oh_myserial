@@ -285,24 +285,45 @@ baud = 115200
 
 ## 怎么用（场景）
 
-### A. 人 + Agent（推荐）
-
-1. hub 占真串口  
-2. 上位机连 PTY 或 TCP  
-3. Agent 用 WebSocket 收日志 + HTTP 发命令  
+### 核心：一个真串口 → 并联多个监控/交互端
 
 ```text
-上位机 ──PTY/TCP──► ohmyserial ──► 设备
-Agent  ──WS/HTTP──►      ▲
+                 ┌─ PTY /tmp/ohmyserial-v0  → 串口上位机 #1
+                 ├─ PTY /tmp/ohmyserial-v1  → 串口上位机 #2 / Agent 读虚拟串口
+ 真串口 ──► hub ─┼─ TCP :8788            → 多个脚本同时连
+                 ├─ TCP :8789            → 更多工具
+                 └─ WS  /v1/stream        → 多个 Agent 同时连
 ```
+
+所有端看到**同一份实时 RX**；TX 由策略/写锁仲裁，避免静默交错。
+
+用 **`[fanout]`** 一键批量生成，或用 `[[clients]]` 逐个声明。
+
+```bash
+curl -s http://127.0.0.1:8787/v1/endpoints
+```
+
+### A. 多上位机 + Agent
+
+```toml
+[fanout]
+pty_count = 2
+pty_link_prefix = "/tmp/ohmyserial-v"
+tcp_count = 1
+tcp_base_port = 8788
+```
+
+- 两个串口软件分别打开 `v0` / `v1`  
+- Agent：`ws://127.0.0.1:8787/v1/stream`（可多连）  
+- 脚本：`nc 127.0.0.1 8788`（可多连）
 
 ### B. 仅脚本 / CI
 
-开 TCP + API，用 `nc`、Python 或流水线访问 `8787`/`8788`。
+`tcp_count = 2` + API，不配 PTY。
 
 ### C. 无硬件演示
 
-`path = "mock:demo"`，写入会作为 RX 回环。
+`path = "mock:demo"` 回环。
 
 ### D. 写锁独占窗口
 

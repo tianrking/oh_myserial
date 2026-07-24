@@ -1,6 +1,6 @@
 //! Hub supervisor: wires config → serial + broker + clients.
 
-use crate::broker::{Broker, PortStatus};
+use crate::broker::{Broker, EndpointView, PortStatus};
 use crate::client::{spawn_api_server, spawn_tcp_listener, ApiState};
 use crate::config::{ClientConfig, Config};
 use crate::observe::SessionLog;
@@ -38,7 +38,7 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
             _ => None,
         })
         .max()
-        .unwrap_or(0);
+        .unwrap_or(65_536);
 
     let port = PortStatus {
         path: cfg.real.path.clone(),
@@ -51,11 +51,41 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
     let broker = split.broker;
     let serial_rx = split.serial_tx_rx;
 
+    // Publish endpoint catalog (1 real → many virtual / network endpoints).
+    let endpoints: Vec<EndpointView> = cfg
+        .endpoint_catalog()
+        .into_iter()
+        .map(|e| EndpointView {
+            kind: e.kind,
+            name: e.name,
+            address: e.address,
+            can_read: e.can_read,
+            can_write: e.can_write,
+            note: e.note,
+        })
+        .collect();
+    for ep in &endpoints {
+        tracing::info!(
+            "fanout endpoint kind={} name={} address={} (r={} w={}) — {}",
+            ep.kind,
+            ep.name,
+            ep.address,
+            ep.can_read,
+            ep.can_write,
+            ep.note
+        );
+        log.event(&format!(
+            "endpoint kind={} name={} address={}",
+            ep.kind, ep.name, ep.address
+        ));
+    }
+    broker.set_endpoints(endpoints);
+
     let serial = SerialHub::start(cfg.real.clone(), broker.clone(), serial_rx);
 
     let mut tasks = Vec::new();
 
-    // Global API (HTTP/WS)
+    // Global API (HTTP/WS) — one bind, unlimited concurrent WebSocket monitors/agents.
     if cfg.api.enabled {
         let history = history_cap.max(0);
         let st = ApiState {
@@ -106,7 +136,7 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
                     }
                 } else {
                     tracing::info!(
-                        "websocket client '{name}' served by global api on {}",
+                        "websocket client '{name}' served by global api on {} (/v1/stream, multi-client)",
                         cfg.api.bind
                     );
                 }
@@ -139,7 +169,11 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
     // Give mock/serial a moment to open.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     log.event("hub_ready");
-    tracing::info!("ohmyserial hub ready (port={})", cfg.real.path);
+    tracing::info!(
+        "ohmyserial hub ready (real={} → {} fan-out endpoints)",
+        cfg.real.path,
+        cfg.endpoint_catalog().len()
+    );
 
     Ok(HubHandle {
         serial,

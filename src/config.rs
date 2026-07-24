@@ -9,13 +9,64 @@ pub struct Config {
     pub real: RealPortConfig,
     #[serde(default)]
     pub tx: TxConfig,
+    /// Explicit client endpoints (PTY / TCP / WebSocket).
     #[serde(default)]
     pub clients: Vec<ClientConfig>,
+    /// Bulk fan-out: expand one real port into many virtual serial / TCP / WS endpoints.
+    #[serde(default)]
+    pub fanout: FanoutConfig,
     #[serde(default)]
     pub log: LogConfig,
     /// Optional HTTP/WS control plane bind (also used when a websocket client has no bind).
     #[serde(default)]
     pub api: ApiConfig,
+}
+
+/// One-real-port → many parallel monitoring/interaction endpoints.
+///
+/// After load, [`Config::expand_fanout`] materializes these into [`Config::clients`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FanoutConfig {
+    /// How many Unix PTY virtual serial ports to create (macOS/Linux).
+    /// Links: `{pty_link_prefix}0`, `{pty_link_prefix}1`, …
+    #[serde(default)]
+    pub pty_count: u32,
+    #[serde(default = "default_pty_link_prefix")]
+    pub pty_link_prefix: String,
+    #[serde(default = "default_pty_name_prefix")]
+    pub pty_name_prefix: String,
+    #[serde(default = "default_true")]
+    pub pty_can_write: bool,
+    #[serde(default = "default_true")]
+    pub pty_can_read: bool,
+
+    /// How many TCP listeners to open. Each listener accepts **many** concurrent clients;
+    /// every connection gets full RX and may TX (per policy).
+    #[serde(default)]
+    pub tcp_count: u32,
+    #[serde(default = "default_tcp_host")]
+    pub tcp_host: String,
+    #[serde(default = "default_tcp_base_port")]
+    pub tcp_base_port: u16,
+    #[serde(default = "default_tcp_name_prefix")]
+    pub tcp_name_prefix: String,
+    #[serde(default = "default_true")]
+    pub tcp_can_write: bool,
+    #[serde(default = "default_true")]
+    pub tcp_can_read: bool,
+
+    /// Extra dedicated HTTP/WS binds (full API + `/v1/stream`).
+    /// The primary `[api].bind` already allows unlimited concurrent WebSocket clients.
+    #[serde(default)]
+    pub ws_binds: Vec<String>,
+    #[serde(default = "default_ws_name_prefix")]
+    pub ws_name_prefix: String,
+    #[serde(default = "default_history_bytes")]
+    pub ws_history_bytes: usize,
+    #[serde(default = "default_true")]
+    pub ws_can_write: bool,
+    #[serde(default = "default_true")]
+    pub ws_can_read: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,18 +235,183 @@ impl Default for Config {
                 can_write: true,
                 can_read: true,
             }],
+            fanout: FanoutConfig::default(),
             log: LogConfig::default(),
             api: ApiConfig::default(),
         }
     }
 }
 
+/// Static description of a configured fan-out endpoint (for status / docs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointDesc {
+    pub kind: String,
+    pub name: String,
+    /// Path, bind address, or URL path depending on kind.
+    pub address: String,
+    pub can_read: bool,
+    pub can_write: bool,
+    /// Human note, e.g. "many concurrent connections".
+    pub note: String,
+}
+
 impl Config {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        let cfg: Config = toml::from_str(&text)?;
+        let mut cfg: Config = toml::from_str(&text)?;
+        cfg.expand_fanout()?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Expand `[fanout]` into concrete `[[clients]]` entries (idempotent names).
+    pub fn expand_fanout(&mut self) -> anyhow::Result<()> {
+        let f = self.fanout.clone();
+        let existing: std::collections::HashSet<String> =
+            self.clients.iter().map(|c| c.name().to_string()).collect();
+
+        // --- PTY bulk ---
+        if f.pty_count > 0 {
+            #[cfg(not(unix))]
+            {
+                anyhow::bail!(
+                    "fanout.pty_count={} is set but PTY is only supported on macOS/Linux",
+                    f.pty_count
+                );
+            }
+            #[cfg(unix)]
+            {
+                for i in 0..f.pty_count {
+                    let name = format!("{}{}", f.pty_name_prefix, i);
+                    if existing.contains(&name)
+                        || self.clients.iter().any(|c| c.name() == name)
+                    {
+                        continue;
+                    }
+                    let link = PathBuf::from(format!("{}{}", f.pty_link_prefix, i));
+                    self.clients.push(ClientConfig::Pty {
+                        name,
+                        link,
+                        can_write: f.pty_can_write,
+                        can_read: f.pty_can_read,
+                    });
+                }
+            }
+        }
+
+        // --- TCP bulk ---
+        for i in 0..f.tcp_count {
+            let name = format!("{}{}", f.tcp_name_prefix, i);
+            if self.clients.iter().any(|c| c.name() == name) {
+                continue;
+            }
+            let port = f
+                .tcp_base_port
+                .checked_add(i as u16)
+                .ok_or_else(|| anyhow::anyhow!("tcp_base_port overflow"))?;
+            let bind = format!("{}:{}", f.tcp_host, port);
+            self.clients.push(ClientConfig::Tcp {
+                name,
+                bind,
+                can_write: f.tcp_can_write,
+                can_read: f.tcp_can_read,
+            });
+        }
+
+        // --- Extra WS binds ---
+        for (i, bind) in f.ws_binds.iter().enumerate() {
+            let name = format!("{}{}", f.ws_name_prefix, i);
+            if self.clients.iter().any(|c| c.name() == name) {
+                continue;
+            }
+            self.clients.push(ClientConfig::Websocket {
+                name,
+                bind: Some(bind.clone()),
+                can_write: f.ws_can_write,
+                can_read: f.ws_can_read,
+                history_bytes: f.ws_history_bytes,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Describe all endpoints that will be offered (after expand).
+    pub fn endpoint_catalog(&self) -> Vec<EndpointDesc> {
+        let mut out = Vec::new();
+        if self.api.enabled {
+            out.push(EndpointDesc {
+                kind: "http".into(),
+                name: "api".into(),
+                address: format!("http://{}", self.api.bind),
+                can_read: true,
+                can_write: true,
+                note: "control plane; unlimited concurrent WS on /v1/stream".into(),
+            });
+            out.push(EndpointDesc {
+                kind: "websocket".into(),
+                name: "api-stream".into(),
+                address: format!("ws://{}/v1/stream", self.api.bind),
+                can_read: true,
+                can_write: true,
+                note: "many agents/tools can connect at once; full RX fan-out".into(),
+            });
+        }
+        for c in &self.clients {
+            match c {
+                ClientConfig::Pty {
+                    name,
+                    link,
+                    can_write,
+                    can_read,
+                } => out.push(EndpointDesc {
+                    kind: "pty".into(),
+                    name: name.clone(),
+                    address: link.display().to_string(),
+                    can_read: *can_read,
+                    can_write: *can_write,
+                    note: "virtual serial for classic host tools (one opener per PTY)".into(),
+                }),
+                ClientConfig::Tcp {
+                    name,
+                    bind,
+                    can_write,
+                    can_read,
+                } => out.push(EndpointDesc {
+                    kind: "tcp".into(),
+                    name: name.clone(),
+                    address: bind.clone(),
+                    can_read: *can_read,
+                    can_write: *can_write,
+                    note: "raw stream; many concurrent TCP clients per bind".into(),
+                }),
+                ClientConfig::Websocket {
+                    name,
+                    bind,
+                    can_write,
+                    can_read,
+                    ..
+                } => {
+                    let addr = bind
+                        .as_ref()
+                        .map(|b| format!("ws://{b}/v1/stream"))
+                        .unwrap_or_else(|| format!("ws://{}/v1/stream", self.api.bind));
+                    out.push(EndpointDesc {
+                        kind: "websocket".into(),
+                        name: name.clone(),
+                        address: addr,
+                        can_read: *can_read,
+                        can_write: *can_write,
+                        note: if bind.is_some() {
+                            "dedicated WS/HTTP server bind".into()
+                        } else {
+                            "served by primary [api] server".into()
+                        },
+                    });
+                }
+            }
+        }
+        out
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -297,6 +513,24 @@ fn default_history_bytes() -> usize {
 fn default_log_format() -> String {
     "hex+text".into()
 }
+fn default_pty_link_prefix() -> String {
+    "/tmp/ohmyserial-v".into()
+}
+fn default_pty_name_prefix() -> String {
+    "v".into()
+}
+fn default_tcp_host() -> String {
+    "127.0.0.1".into()
+}
+fn default_tcp_base_port() -> u16 {
+    8788
+}
+fn default_tcp_name_prefix() -> String {
+    "tcp".into()
+}
+fn default_ws_name_prefix() -> String {
+    "ws".into()
+}
 
 #[cfg(test)]
 mod tests {
@@ -319,9 +553,62 @@ type = "tcp"
 name = "a"
 bind = "127.0.0.1:9999"
 "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.expand_fanout().unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.real.baud, 9600);
         assert_eq!(cfg.clients.len(), 1);
+    }
+
+    #[test]
+    fn fanout_expands_tcp_ports() {
+        let toml = r#"
+[real]
+path = "mock:test"
+
+[fanout]
+tcp_count = 3
+tcp_host = "127.0.0.1"
+tcp_base_port = 19000
+tcp_name_prefix = "m"
+"#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.expand_fanout().unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.clients.len(), 3);
+        match &cfg.clients[1] {
+            ClientConfig::Tcp { name, bind, .. } => {
+                assert_eq!(name, "m1");
+                assert_eq!(bind, "127.0.0.1:19001");
+            }
+            _ => panic!("expected tcp"),
+        }
+        let eps = cfg.endpoint_catalog();
+        assert!(eps.iter().any(|e| e.kind == "tcp" && e.address.contains("19001")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fanout_expands_pty() {
+        let toml = r#"
+[real]
+path = "mock:test"
+
+[fanout]
+pty_count = 2
+pty_link_prefix = "/tmp/oms-test-v"
+pty_name_prefix = "p"
+"#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.expand_fanout().unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.clients.len(), 2);
+        match &cfg.clients[0] {
+            ClientConfig::Pty { name, link, .. } => {
+                assert_eq!(name, "p0");
+                assert_eq!(link.to_string_lossy(), "/tmp/oms-test-v0");
+            }
+            _ => panic!("expected pty"),
+        }
     }
 }
