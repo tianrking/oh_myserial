@@ -8,7 +8,9 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
+# dist is committed so `cargo build` can rust-embed the UI without Node.
+# Rebuild with: cd web && npm run build
+# dist
 dist-ssr
 *.local
 
