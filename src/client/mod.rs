@@ -7,9 +7,9 @@ mod tcp;
 #[cfg(unix)]
 mod pty;
 
-pub use api::{spawn_api_server, ApiState};
+pub use api::{spawn_api_server, spawn_api_server_owned, ApiServerHandle, ApiState};
 pub use static_ui::ui_embedded;
 pub use tcp::spawn_tcp_listener;
 
 #[cfg(unix)]
-pub use pty::spawn_pty_client;
+pub use pty::{prepare_pty_client, spawn_pty_client, PreparedPtyClient};

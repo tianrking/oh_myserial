@@ -315,11 +315,25 @@ tcp_base_port = 8788
 ### D. 写锁独占窗口
 
 ```bash
+LEASE_TOKEN="$(curl -s -X POST http://127.0.0.1:8787/v1/lock \
+  -H 'content-type: application/json' \
+  -d '{"as_client":"agent"}' | jq -r '.lock.lease_token')"
+
+curl -s -X POST http://127.0.0.1:8787/v1/write \
+  -H 'content-type: application/json' \
+  -d "{\"text\":\"AT\",\"newline\":true,\"as_client\":\"agent\",\"lease_token\":\"$LEASE_TOKEN\"}"
+
+# 在租约到期前续租
 curl -s -X POST http://127.0.0.1:8787/v1/lock \
   -H 'content-type: application/json' \
-  -d '{"as_client":"agent"}'
-curl -s -X DELETE http://127.0.0.1:8787/v1/lock
+  -d "{\"lease_token\":\"$LEASE_TOKEN\"}"
+
+curl -s -X DELETE http://127.0.0.1:8787/v1/lock \
+  -H 'content-type: application/json' \
+  -d "{\"lease_token\":\"$LEASE_TOKEN\"}"
 ```
+
+`as_client` 只是显示和审计名称，不是凭证；同名客户端不能冒充持锁者。请把不透明的 `lease_token` 当作秘密，仅保存在内存中。
 
 ---
 
@@ -337,11 +351,20 @@ reconnect = true
 mode = "queue_by_line"     # queue_by_line | queue_by_frame | exclusive | primary_wins
 primary = "ui"
 write_lock_ms = 3000
+write_timeout_ms = 5000
+max_frame_bytes = 65536
+max_write_bytes = 65536
 slow_client = "drop_oldest"
+client_queue = 256
+slow_block_ms = 1000
 
 [api]
 bind = "127.0.0.1:8787"
 enabled = true
+can_read = true
+can_write = true
+# token_env = "OHMYSERIAL_API_TOKEN"
+# cors_origins = ["https://serial-console.example.com"]
 
 [[clients]]
 type = "tcp"
@@ -368,7 +391,12 @@ format = "hex+text"
 |------|------|
 | `real.path` | 设备路径或 `mock:名称` |
 | `tx.mode` | 并发写策略 |
-| `api.bind` | HTTP/WS 地址（建议本机） |
+| `tx.write_timeout_ms` | 入队到主机写入确认的总超时 |
+| `tx.max_frame_bytes` / `max_write_bytes` | 流式帧与原子写入的大小上限 |
+| `tx.slow_client` / `client_queue` / `slow_block_ms` | 每个读客户端的有界背压策略 |
+| `api.bind` | HTTP/WS 地址；明文监听始终限制为回环地址 |
+| `api.token_env` | 保存 API Bearer 密钥的环境变量名，密钥不写入 TOML |
+| `api.cors_origins` | 精确的浏览器 Origin 白名单；空值仅同源，拒绝 `*` |
 | `can_read` / `can_write` | 客户端权限 |
 
 ---
@@ -392,6 +420,10 @@ RUST_LOG=debug ohmyserial run -c ohmyserial.toml
 
 **默认根地址：** `http://127.0.0.1:8787`
 
+明文 API 和独立 WebSocket 监听始终限制为回环地址。配置 `api.token_env` 后，除 `/v1/health` 外的所有 `/v1/*` 请求都必须带 `Authorization: Bearer <token>`。密钥只从该环境变量读取，不要放进 TOML、URL 或日志。Bearer 不能保护网络上的明文 `http://` / `ws://`，因此即使配置 token，非回环监听也会拒绝启动；远程访问请使用 SSH 隧道，或在回环监听前部署 TLS 反向代理。
+
+浏览器默认只能同源调用；请求的 Host 还必须对应实际回环监听地址，以阻断 DNS rebinding 别名。`api.cors_origins` 只放行逐项精确匹配的 Origin，通配符会被拒绝。WebSocket 还会单独检查 `Origin` 是否同主机或在白名单中。浏览器用 `new WebSocket(url, ["bearer", token])` 传 Bearer，不支持查询参数 token；无 `Origin` 的非浏览器客户端在启用鉴权时仍须提供 Bearer。
+
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET` | `/v1/health` | 存活检查 |
@@ -414,15 +446,30 @@ curl -s -X POST http://127.0.0.1:8787/v1/write \
   -d '{"hex":"41 54 0d 0a","as_client":"agent"}'
 ```
 
+HTTP 的 text/hex 都按一次原子命令处理，不受分隔符组帧影响。`ok: true` 表示串口所有者线程已完成主机侧 `write_all` 和 `flush`，不代表设备已解析或确认命令。入队和确认共用 `tx.write_timeout_ms` 截止时间；若错误提示结果可能为 partial/unknown，驱动可能已经写出部分或全部字节，不能盲目重试。
+
+租约生效时，写请求必须携带 `lease_token`。`POST /v1/lock` 首次申请会返回随机 token；带 token 再次 POST 是续租；`DELETE /v1/lock` 带 token 才能释放。状态接口不会泄露 token。
+
 ### WebSocket
 
 ```text
 ws://127.0.0.1:8787/v1/stream
 ```
 
+- 服务端发二进制 RX；连接后可能先发送历史缓存。
+- 客户端发文本时补换行并走流式组帧；发二进制时整帧作为一次原子写入，受 `max_write_bytes` 限制。
+- 写入被拒绝时会收到 `type = "ohmyserial.error"` 的 JSON 文本帧。WebSocket 入队不等于设备写入确认；需要主机写入 + flush 结果时使用 HTTP。
+
 ### TCP
 
 ```bash
+nc 127.0.0.1 8788
+```
+
+原始 TCP 没有 API Bearer 握手，必须保持回环监听。远程使用时通过 SSH 隧道转发：
+
+```bash
+ssh -L 8788:127.0.0.1:8788 user@device-host
 nc 127.0.0.1 8788
 ```
 
@@ -451,9 +498,20 @@ print(urllib.request.urlopen(req).read().decode())
 | `exclusive` | 必须持有写锁才能发 | 烧录 / 危险操作 |
 | `primary_wins` | 优先 `tx.primary` | 人在环 |
 
-**写锁** 生效期间仅所有者可 TX；超时、主动释放或断线会释放。
+**写租约** 生效期间，只有携带随机 `lease_token` 的请求可以 TX；owner 字符串只用于显示/审计。租约仅在 TTL 到期或持 token 主动释放时结束，同名 HTTP、WebSocket、TCP 或 PTY 客户端断线不会释放租约。
 
-`slow_client = drop_oldest`：保证真口读取不被慢客户端拖死。
+每个可读客户端都有以块计数的有界 RX 队列 `client_queue`：
+
+| `slow_client` | 队列满时的行为 |
+|---------------|----------------|
+| `drop_oldest` **（默认）** | 丢弃该客户端最旧的待处理 RX 块，再放入新块 |
+| `drop_newest` | 保留已有数据，丢弃发给该客户端的新块 |
+| `disconnect_slow` | 立即断开慢客户端 |
+| `block` | 最多等待 `slow_block_ms`，仍无空间则断开慢客户端 |
+
+`queue_by_line` / `queue_by_frame` 的缓存受 `max_frame_bytes` 限制，HTTP 和 WS 二进制原子写受 `max_write_bytes` 限制。每次连接都有递增 epoch；写入在真正触发主机写操作前会再次核对 epoch、截止时间和租约，因此断线前排队的旧字节不会在重连后回放到新会话。
+
+启动时会先完成配置校验和监听端口绑定；任一绑定失败都会让 hub 启动失败并撤销已经启动的任务。关闭时会停止串口所有者、关闭 fan-out，并拒绝/排空待写队列，不留下脱管后台任务。
 
 ---
 
@@ -490,7 +548,7 @@ can_read = true
 
 - 默认只绑 **`127.0.0.1`**  
 - 串口写入等同于碰硬件（复位、危险指令）  
-- 勿在不可信网络把服务绑到 `0.0.0.0`（MVP 无鉴权）  
+- 明文 API、WebSocket 和原始 TCP 都只能监听回环地址；远程访问使用 SSH 或 TLS 反向代理
 - 日志可能含设备吐出的敏感信息  
 
 ---
@@ -548,7 +606,7 @@ CI：Ubuntu · macOS · Windows。
 不是。它是可交互的 **共享中枢**，带 TX 控制。
 
 **mock 需要硬件吗？**  
-不需要。
+不需要。`mock:demo` 能验证 hub、策略、租约、API 和关闭流程，但不能证明操作系统串口驱动、USB/UART 时序、物理控制线或真实设备命令确认正确。
 
 ---
 

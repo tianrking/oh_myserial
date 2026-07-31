@@ -53,9 +53,7 @@ async fn free_port() -> u16 {
 }
 
 async fn http_get(url: &str) -> String {
-    let url = url
-        .strip_prefix("http://")
-        .expect("http");
+    let url = url.strip_prefix("http://").expect("http");
     let (host_port, path) = url
         .split_once('/')
         .map(|(h, p)| (h, format!("/{p}")))
@@ -102,7 +100,10 @@ async fn mock_loopback_tcp_and_status() {
 
     let status = http_get(&format!("http://127.0.0.1:{api_port}/v1/status")).await;
     assert!(status.contains("mock:integration"), "status={status}");
-    assert!(status.contains("\"connected\":true") || status.contains("connected\": true"), "status={status}");
+    assert!(
+        status.contains("\"connected\":true") || status.contains("connected\": true"),
+        "status={status}"
+    );
 
     // TCP client receives mock loopback of HTTP write
     let mut tcp = TcpStream::connect(format!("127.0.0.1:{tcp_port}"))
@@ -115,7 +116,10 @@ async fn mock_loopback_tcp_and_status() {
         r#"{"text":"ping-from-api","newline":true}"#,
     )
     .await;
-    assert!(resp.contains("\"ok\":true") || resp.contains("ok\": true"), "write={resp}");
+    assert!(
+        resp.contains("\"ok\":true") || resp.contains("ok\": true"),
+        "write={resp}"
+    );
 
     let mut buf = vec![0u8; 256];
     let n = tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut buf))
@@ -142,6 +146,10 @@ async fn write_lock_blocks_other_client_name() {
     )
     .await;
     assert!(lock.contains("ok"), "lock={lock}");
+    let lock_json: serde_json::Value = serde_json::from_str(&lock).expect("lock json");
+    let lease_token = lock_json["lock"]["lease_token"]
+        .as_str()
+        .expect("lease token");
 
     let denied = http_post_json(
         &format!("http://127.0.0.1:{api_port}/v1/write"),
@@ -155,12 +163,80 @@ async fn write_lock_blocks_other_client_name() {
 
     let ok = http_post_json(
         &format!("http://127.0.0.1:{api_port}/v1/write"),
-        r#"{"text":"yes","as_client":"owner","newline":true}"#,
+        &serde_json::json!({
+            "text": "yes",
+            "as_client": "owner",
+            "lease_token": lease_token,
+            "newline": true
+        })
+        .to_string(),
     )
     .await;
     assert!(ok.contains("true"), "ok={ok}");
 
     handle.shutdown();
+}
+
+#[tokio::test]
+async fn http_hex_is_one_atomic_write_without_a_delimiter() {
+    let api_port = free_port().await;
+    let tcp_port = free_port().await;
+    let cfg = test_config(api_port, tcp_port);
+    let handle = hub::run_hub(cfg).await.expect("hub");
+
+    let mut tcp = TcpStream::connect(format!("127.0.0.1:{tcp_port}"))
+        .await
+        .expect("tcp connect");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let resp = http_post_json(
+        &format!("http://127.0.0.1:{api_port}/v1/write"),
+        r#"{"hex":"000102ff"}"#,
+    )
+    .await;
+    assert!(resp.contains("\"ok\":true"), "write={resp}");
+
+    let mut got = [0_u8; 4];
+    tokio::time::timeout(Duration::from_secs(2), tcp.read_exact(&mut got))
+        .await
+        .expect("timeout")
+        .expect("read exact");
+    assert_eq!(got, [0x00, 0x01, 0x02, 0xff]);
+
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn hub_start_fails_when_api_bind_is_occupied() {
+    let api_port = free_port().await;
+    let tcp_port = free_port().await;
+    let occupied = tokio::net::TcpListener::bind(("127.0.0.1", api_port))
+        .await
+        .expect("occupy api port");
+    let mut cfg = test_config(api_port, tcp_port);
+    let temp = tempfile::tempdir().unwrap();
+    let log_path = temp.path().join("startup.log");
+    cfg.log.file = Some(log_path.clone());
+    cfg.log.mirror_console = false;
+
+    let err = match hub::run_hub(cfg).await {
+        Ok(handle) => {
+            handle.shutdown();
+            panic!("occupied API bind must fail");
+        }
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("api bind"), "error={err:#}");
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(
+        !log.contains("serial_open"),
+        "serial opened before binds: {log}"
+    );
+    assert!(
+        !log.contains("hub_ready"),
+        "hub reported ready after failure: {log}"
+    );
+    drop(occupied);
 }
 
 #[tokio::test]
@@ -230,4 +306,82 @@ format = "text"
     assert!(eps.contains("endpoints"), "eps={eps}");
 
     handle.shutdown();
+}
+
+#[tokio::test]
+async fn raw_tcp_ingress_reaches_mock_and_fans_out_exact_bytes() {
+    let api_port = free_port().await;
+    let tcp_port = free_port().await;
+    let cfg = test_config(api_port, tcp_port);
+    let handle = hub::run_hub(cfg).await.unwrap();
+
+    let mut origin = TcpStream::connect(format!("127.0.0.1:{tcp_port}"))
+        .await
+        .unwrap();
+    let mut observer = TcpStream::connect(format!("127.0.0.1:{tcp_port}"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let expected = b"tcp-origin\n";
+    origin.write_all(expected).await.unwrap();
+
+    let mut origin_echo = [0_u8; 11];
+    let mut observer_echo = [0_u8; 11];
+    tokio::time::timeout(Duration::from_secs(2), origin.read_exact(&mut origin_echo))
+        .await
+        .expect("origin echo timeout")
+        .expect("origin echo read");
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        observer.read_exact(&mut observer_echo),
+    )
+    .await
+    .expect("observer echo timeout")
+    .expect("observer echo read");
+
+    assert_eq!(&origin_echo, expected);
+    assert_eq!(&observer_echo, expected);
+    handle.shutdown();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pty_prepare_failure_aborts_startup_before_serial_open() {
+    let api_port = free_port().await;
+    let tcp_port = free_port().await;
+    let temp = tempfile::tempdir().unwrap();
+    let link = temp.path().join("must-not-replace");
+    let log_path = temp.path().join("startup.log");
+    std::fs::write(&link, b"keep-me").unwrap();
+
+    let mut cfg = test_config(api_port, tcp_port);
+    cfg.log.file = Some(log_path.clone());
+    cfg.log.mirror_console = false;
+    cfg.clients.push(ohmyserial::config::ClientConfig::Pty {
+        name: "broken-pty".into(),
+        link: link.clone(),
+        can_write: true,
+        can_read: true,
+    });
+    cfg.validate().unwrap();
+
+    let error = match hub::run_hub(cfg).await {
+        Ok(handle) => {
+            handle.shutdown();
+            panic!("regular-file PTY link must make startup fail");
+        }
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("non-symlink"), "{error:#}");
+    assert_eq!(std::fs::read(&link).unwrap(), b"keep-me");
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(
+        !log.contains("serial_open"),
+        "serial opened before PTY setup: {log}"
+    );
+    assert!(
+        !log.contains("hub_ready"),
+        "failed startup reported ready: {log}"
+    );
 }

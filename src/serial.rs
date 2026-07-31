@@ -5,79 +5,110 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use parking_lot::{Condvar, Mutex};
 use serialport::{DataBits, FlowControl, Parity, StopBits};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-use crate::broker::{Broker, PortStatus};
+use crate::broker::{Broker, DeviceWrite, PortStatus};
 use crate::config::RealPortConfig;
 
 pub struct SerialHub {
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+const MAX_READ_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct StopSignal {
+    requested: AtomicBool,
+    wait_lock: Mutex<()>,
+    wake: Condvar,
+}
+
+impl StopSignal {
+    fn request(&self) {
+        // Pair the state change with the condition-variable mutex so a waiter
+        // cannot observe `false` and then miss the notification before it
+        // actually starts waiting.
+        let _guard = self.wait_lock.lock();
+        self.requested.store(true, Ordering::Release);
+        self.wake.notify_all();
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    /// Wait for `timeout`, returning early when shutdown is requested.
+    fn wait_timeout(&self, timeout: Duration) -> bool {
+        if self.is_requested() {
+            return true;
+        }
+
+        let mut guard = self.wait_lock.lock();
+        if self.is_requested() {
+            return true;
+        }
+        self.wake.wait_for(&mut guard, timeout);
+        self.is_requested()
+    }
 }
 
 impl SerialHub {
     pub fn start(
         cfg: RealPortConfig,
         broker: Broker,
-        mut to_device: mpsc::Receiver<Bytes>,
-    ) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
+        to_device: mpsc::Receiver<DeviceWrite>,
+    ) -> anyhow::Result<Self> {
+        let stop = Arc::new(StopSignal::default());
         let stop_r = stop.clone();
-        let stop_w = stop.clone();
         let cfg_r = cfg.clone();
         let broker_r = broker.clone();
 
-        // Channel between writer task and the blocking IO thread.
-        let (write_tx, write_rx) = std::sync::mpsc::channel::<WriteCmd>();
-
-        // Writer task: async -> blocking thread
-        tokio::spawn(async move {
-            while let Some(data) = to_device.recv().await {
-                if stop_w.load(Ordering::Relaxed) {
-                    break;
-                }
-                if write_tx.send(WriteCmd::Data(data)).is_err() {
-                    break;
-                }
-            }
-            let _ = write_tx.send(WriteCmd::Shutdown);
-        });
-
-        // Blocking IO thread owns the serial port handle.
-        std::thread::Builder::new()
+        // The blocking IO thread owns both the serial port and the bounded Tokio
+        // receiver. Keeping the original bounded queue all the way to the device
+        // prevents an async-to-std bridge from silently becoming unbounded.
+        let join = std::thread::Builder::new()
             .name("ohmyserial-serial".into())
-            .spawn(move || serial_thread(cfg_r, broker_r, write_rx, stop_r))
-            .expect("spawn serial thread");
+            .spawn(move || serial_thread(cfg_r, broker_r, to_device, stop_r))?;
 
-        Self { stop }
+        Ok(Self {
+            stop,
+            join: Mutex::new(Some(join)),
+        })
     }
 
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.request();
+        if let Some(join) = self.join.lock().take() {
+            let _ = join.join();
+        }
     }
-}
-
-enum WriteCmd {
-    Data(Bytes),
-    Shutdown,
 }
 
 fn serial_thread(
     cfg: RealPortConfig,
     broker: Broker,
-    write_rx: std::sync::mpsc::Receiver<WriteCmd>,
-    stop: Arc<AtomicBool>,
+    mut write_rx: mpsc::Receiver<DeviceWrite>,
+    stop: Arc<StopSignal>,
 ) {
     if cfg.path.starts_with("mock:") {
-        run_mock(&cfg, &broker, write_rx, stop);
+        run_mock(&cfg, &broker, &mut write_rx, stop);
         return;
     }
 
     let mut backoff = Duration::from_millis(cfg.reconnect_ms.max(50));
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if stop.is_requested() {
             break;
         }
+
+        // Commands accepted for a previous connection must never be replayed
+        // against a newly opened device. This is especially important for boot,
+        // reset and firmware-update commands.
+        drop_pending_writes(&broker, &mut write_rx, "serial_disconnected");
+
         match open_port(&cfg) {
             Ok(mut port) => {
                 broker.set_port_status(PortStatus {
@@ -86,10 +117,18 @@ fn serial_thread(
                     connected: true,
                     detail: "open".into(),
                 });
-                broker.log().event(&format!("serial_open path={}", cfg.path));
+                broker
+                    .log()
+                    .event(&format!("serial_open path={}", cfg.path));
                 backoff = Duration::from_millis(cfg.reconnect_ms.max(50));
 
-                if !io_loop(&mut *port, &broker, &write_rx, &stop, cfg.read_timeout_ms) {
+                if !io_loop(
+                    &mut *port,
+                    &broker,
+                    &mut write_rx,
+                    &stop,
+                    cfg.read_timeout_ms,
+                ) {
                     break; // shutdown
                 }
 
@@ -115,53 +154,84 @@ fn serial_thread(
                 if !cfg.reconnect {
                     break;
                 }
-                std::thread::sleep(backoff);
+                if stop.wait_timeout(backoff) {
+                    break;
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(10));
             }
         }
     }
+    broker.set_port_status(PortStatus {
+        path: cfg.path.clone(),
+        baud: cfg.baud,
+        connected: false,
+        detail: "stopped".into(),
+    });
+    close_pending_writes(&broker, &mut write_rx, "serial_stopped");
 }
 
 fn io_loop(
     port: &mut dyn serialport::SerialPort,
     broker: &Broker,
-    write_rx: &std::sync::mpsc::Receiver<WriteCmd>,
-    stop: &AtomicBool,
+    write_rx: &mut mpsc::Receiver<DeviceWrite>,
+    stop: &StopSignal,
     read_timeout_ms: u64,
 ) -> bool {
+    const MAX_WRITE_BURST: usize = 32;
+    const MAX_WRITE_BURST_BYTES: usize = 256 * 1024;
     let mut buf = [0u8; 4096];
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if stop.is_requested() {
             return false;
         }
 
-        // Non-blocking-ish writes first.
-        loop {
+        // Bound each TX burst so a busy writer cannot starve device RX.
+        let mut burst_bytes = 0usize;
+        for _ in 0..MAX_WRITE_BURST {
             match write_rx.try_recv() {
-                Ok(WriteCmd::Data(data)) => {
-                    if let Err(e) = std::io::Write::write_all(&mut *port, &data) {
+                Ok(write) => {
+                    if stop.is_requested() {
+                        broker.on_device_tx_not_written(write, "serial is stopping");
+                        return false;
+                    }
+                    if let Err(reason) = broker.validate_device_write(&write) {
+                        broker.on_device_tx_not_written(write, reason);
+                        continue;
+                    }
+                    let bytes = write.bytes().len();
+                    let result = std::io::Write::write_all(&mut *port, write.bytes())
+                        .and_then(|_| std::io::Write::flush(&mut *port));
+                    if let Err(e) = result {
                         tracing::warn!("serial write error: {e}");
+                        broker.on_device_tx_failed(write, e.to_string());
                         return true; // reconnect
                     }
-                    let _ = std::io::Write::flush(&mut *port);
+                    broker.on_device_tx_written(write);
+                    burst_bytes = burst_bytes.saturating_add(bytes);
+                    if burst_bytes >= MAX_WRITE_BURST_BYTES {
+                        break;
+                    }
                 }
-                Ok(WriteCmd::Shutdown) => return false,
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => return false,
             }
         }
 
         match std::io::Read::read(&mut *port, &mut buf) {
             Ok(0) => {
                 // timeout or EOF depending on backend
-                std::thread::sleep(Duration::from_millis(read_timeout_ms.min(20)));
+                if stop.wait_timeout(Duration::from_millis(read_timeout_ms.min(20))) {
+                    return false;
+                }
             }
             Ok(n) => {
                 broker.on_device_rx(Bytes::copy_from_slice(&buf[..n]));
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
+                if stop.wait_timeout(Duration::from_millis(5)) {
+                    return false;
+                }
             }
             Err(e) => {
                 tracing::warn!("serial read error: {e}");
@@ -198,17 +268,25 @@ fn open_port(cfg: &RealPortConfig) -> anyhow::Result<Box<dyn serialport::SerialP
         .parity(parity)
         .stop_bits(stop)
         .flow_control(flow)
-        .timeout(Duration::from_millis(cfg.read_timeout_ms.max(10)))
+        // The timeout is an internal polling interval, not a framing or data
+        // retention promise. Capping it keeps shutdown bounded even if a
+        // configuration supplies a very large value; reads still return as
+        // soon as bytes arrive.
+        .timeout(read_poll_timeout(cfg.read_timeout_ms))
         .open()?;
     Ok(port)
+}
+
+fn read_poll_timeout(configured_ms: u64) -> Duration {
+    Duration::from_millis(configured_ms.max(10)).min(MAX_READ_POLL_TIMEOUT)
 }
 
 /// Mock serial: pairs TX back as RX (loopback) and accepts inject via optional channel later.
 fn run_mock(
     cfg: &RealPortConfig,
     broker: &Broker,
-    write_rx: std::sync::mpsc::Receiver<WriteCmd>,
-    stop: Arc<AtomicBool>,
+    write_rx: &mut mpsc::Receiver<DeviceWrite>,
+    stop: Arc<StopSignal>,
 ) {
     broker.set_port_status(PortStatus {
         path: cfg.path.clone(),
@@ -221,15 +299,24 @@ fn run_mock(
         .event(&format!("serial_open path={} (mock)", cfg.path));
 
     // Optional inject path: mock:name listens on a side channel via global? Keep simple loopback.
-    while !stop.load(Ordering::Relaxed) {
-        match write_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(WriteCmd::Data(data)) => {
+    while !stop.is_requested() {
+        match write_rx.try_recv() {
+            Ok(write) => {
+                if let Err(reason) = broker.validate_device_write(&write) {
+                    broker.on_device_tx_not_written(write, reason);
+                    continue;
+                }
                 // loopback
+                let data = write.bytes().clone();
+                broker.on_device_tx_written(write);
                 broker.on_device_rx(data);
             }
-            Ok(WriteCmd::Shutdown) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                if stop.wait_timeout(Duration::from_millis(10)) {
+                    break;
+                }
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
         }
     }
 
@@ -239,6 +326,47 @@ fn run_mock(
         connected: false,
         detail: "mock closed".into(),
     });
+    close_pending_writes(broker, write_rx, "serial_stopped");
+}
+
+impl Drop for SerialHub {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn drop_pending_writes(broker: &Broker, write_rx: &mut mpsc::Receiver<DeviceWrite>, reason: &str) {
+    let mut chunks = 0_u64;
+    let mut bytes = 0_u64;
+    while let Ok(write) = write_rx.try_recv() {
+        chunks += 1;
+        bytes += write.bytes().len() as u64;
+        broker.on_device_tx_not_written(write, reason);
+    }
+    if chunks > 0 {
+        broker.log().event(&format!(
+            "tx_gap reason={reason} chunks={chunks} bytes={bytes}"
+        ));
+        tracing::warn!(chunks, bytes, reason, "discarded stale serial writes");
+    }
+}
+
+fn close_pending_writes(broker: &Broker, write_rx: &mut mpsc::Receiver<DeviceWrite>, reason: &str) {
+    write_rx.close();
+    let mut chunks = 0_u64;
+    let mut bytes = 0_u64;
+    // After close, blocking_recv waits for every outstanding Sender permit to
+    // be sent or dropped. This closes the final shutdown race without polling.
+    while let Some(write) = write_rx.blocking_recv() {
+        chunks += 1;
+        bytes += write.bytes().len() as u64;
+        broker.on_device_tx_not_written(write, reason);
+    }
+    if chunks > 0 {
+        broker.log().event(&format!(
+            "tx_queue_drained reason={reason} chunks={chunks} bytes={bytes}"
+        ));
+    }
 }
 
 /// List available serial ports on this machine.
@@ -269,6 +397,164 @@ pub fn inject_rx(broker: &Broker, data: Bytes) {
     broker.on_device_rx(data);
 }
 
-/// Graceful join placeholder.
-#[allow(dead_code)]
-pub struct JoinOnDrop(Option<oneshot::Sender<()>>);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observe::SessionLog;
+    use crate::policy::{Policy, SlowClientPolicy, TxMode};
+
+    fn test_split(connected: bool) -> crate::broker::BrokerSplit {
+        Broker::new(
+            Policy {
+                mode: TxMode::QueueByLine,
+                primary: None,
+                write_lock_ms: 1000,
+                write_timeout_ms: 1000,
+                max_frame_bytes: 1024,
+                max_write_bytes: 1024,
+                frame_delim: b'\n',
+                slow_client: SlowClientPolicy::DropOldest,
+                client_queue: 16,
+                slow_block_ms: 100,
+            },
+            PortStatus {
+                path: "mock:serial-test".into(),
+                baud: 115_200,
+                connected,
+                detail: "test".into(),
+            },
+            SessionLog::disabled(),
+            1024,
+            16,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn closing_a_full_writer_queue_resolves_all_waiters() {
+        let split = test_split(true);
+        let broker = split.broker;
+        let mut write_rx = split.serial_tx_rx;
+        let mut writers = Vec::new();
+        for index in 0..48u8 {
+            let broker = broker.clone();
+            writers.push(tokio::spawn(async move {
+                broker
+                    .api_write_confirmed_with_lease(
+                        &format!("writer-{index}"),
+                        Bytes::from(vec![index]),
+                        None,
+                    )
+                    .await
+            }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while broker.snapshot().clients.len() < 16 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writers did not fill the bounded queue");
+
+        broker.set_port_status(PortStatus {
+            path: "mock:serial-test".into(),
+            baud: 115_200,
+            connected: false,
+            detail: "shutdown".into(),
+        });
+        let broker_for_close = broker.clone();
+        tokio::task::spawn_blocking(move || {
+            close_pending_writes(&broker_for_close, &mut write_rx, "test_shutdown")
+        })
+        .await
+        .unwrap();
+
+        for writer in writers {
+            let result = tokio::time::timeout(Duration::from_secs(1), writer)
+                .await
+                .expect("confirmed writer hung during shutdown")
+                .unwrap();
+            assert!(result.is_err());
+        }
+        assert!(!broker.snapshot().port.connected);
+        assert!(broker.snapshot().clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serial_hub_stop_with_large_read_timeout_is_bounded() {
+        let split = test_split(false);
+        let broker = split.broker;
+        let cfg = RealPortConfig {
+            path: "mock:serial-drop".into(),
+            baud: 115_200,
+            databits: 8,
+            parity: "none".into(),
+            stopbits: 1,
+            flow: "none".into(),
+            reconnect: true,
+            reconnect_ms: 10,
+            read_timeout_ms: u64::MAX,
+        };
+        let serial = SerialHub::start(cfg, broker.clone(), split.serial_tx_rx).unwrap();
+        assert!(wait_connected(&broker, Duration::from_secs(1)).await);
+
+        let started = std::time::Instant::now();
+        serial.stop();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "mock serial shutdown took {:?}",
+            started.elapsed()
+        );
+        assert!(!broker.snapshot().port.connected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serial_hub_stop_interrupts_long_reconnect_backoff() {
+        let split = test_split(false);
+        let broker = split.broker;
+        let cfg = RealPortConfig {
+            path: if cfg!(windows) {
+                "COM255".into()
+            } else {
+                "/dev/ohmyserial-port-that-does-not-exist".into()
+            },
+            baud: 115_200,
+            databits: 8,
+            parity: "none".into(),
+            stopbits: 1,
+            flow: "none".into(),
+            reconnect: true,
+            reconnect_ms: 60_000,
+            read_timeout_ms: u64::MAX,
+        };
+        let serial = SerialHub::start(cfg, broker.clone(), split.serial_tx_rx).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if broker.snapshot().port.detail.starts_with("open error:") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("serial thread did not enter reconnect backoff");
+
+        let started = std::time::Instant::now();
+        serial.stop();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "reconnect shutdown took {:?}",
+            started.elapsed()
+        );
+        assert!(!broker.snapshot().port.connected);
+        assert_eq!(broker.snapshot().port.detail, "stopped");
+    }
+
+    #[test]
+    fn real_port_read_poll_timeout_has_a_shutdown_safe_upper_bound() {
+        assert_eq!(read_poll_timeout(0), Duration::from_millis(10));
+        assert_eq!(read_poll_timeout(50), Duration::from_millis(50));
+        assert_eq!(read_poll_timeout(u64::MAX), MAX_READ_POLL_TIMEOUT);
+    }
+}

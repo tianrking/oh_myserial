@@ -4,7 +4,7 @@
 React 控制台（`web/`）與 AI Agent 皆應遵守此規格。
 
 > 預設位址：`http://127.0.0.1:8787` · WebSocket：`ws://127.0.0.1:8787/v1/stream`  
-> hub 僅綁定本機時，資料不會出網；請勿在未授權網路暴露 `0.0.0.0`。
+> hub 的明文 API / WebSocket / 原始 TCP 僅允許 loopback。Bearer 可作額外防護，但不會讓網路上的明文安全；遠端存取請使用 SSH tunnel 或 TLS reverse proxy。
 
 ---
 
@@ -47,9 +47,22 @@ React 控制台（`web/`）與 AI Agent 皆應遵守此規格。
 
 ### 2.3 CORS
 
-hub 目前允許任意 Origin（方便本機 Vite / 靜態站）。生產環境若暴露外網，應改為白名單。
+未設定 `api.cors_origins` 時不加 CORS header，瀏覽器只能同源呼叫。設定時只接受完整、精確的 Origin（例如 `https://console.example.com`），`*`、含路徑、query 或 fragment 的值會在啟動時被拒絕。
 
-### 2.4 HTTPS 頁面連本機
+WebSocket upgrade 另外檢查 `Origin`：瀏覽器來源必須與 hub 的 `Host` 相同，或列於 `cors_origins`。非瀏覽器 Agent 通常不帶 `Origin`，可通過這項檢查，但啟用 Bearer 後仍必須通過鑑權。
+
+### 2.4 Bearer 鑑權
+
+`api.token_env` 填的是**環境變數名稱**，密鑰只從該環境變數讀取，不得寫入 TOML、URL 或日誌。明文 API 與獨立 WebSocket bind 即使有 token 也只能使用 loopback；非回環設定會拒絕啟動。
+
+- `/v1/health` 保持公開，方便 supervisor 探活。
+- 其他 `/v1/*` HTTP：`Authorization: Bearer <token>`。
+- 瀏覽器 WebSocket 無法設定 Authorization header，使用 `new WebSocket(url, ["bearer", token])`；伺服器只回選不含密鑰的 `bearer` subprotocol。
+- 不支援 query-string token。
+
+API Bearer 用於存取 hub；下文的 `lease_token` 用於獨占 TX，兩者是不同憑證。
+
+### 2.5 HTTPS 頁面連本機
 
 若網頁託管於 **HTTPS**（如 Vercel），連 `ws://127.0.0.1` 可能被瀏覽器混合內容策略阻擋。  
 **建議**：開發用 `http://localhost:5173`；正式操控優先使用本機 HTTP 頁，或接受使用者手動授權。
@@ -58,7 +71,7 @@ hub 目前允許任意 Origin（方便本機 Vite / 靜態站）。生產環境�
 
 ## 3. HTTP API
 
-所有 JSON 請求：`Content-Type: application/json`（有 body 時）。
+所有 JSON 請求：`Content-Type: application/json`（有 body 時）。啟用 API Bearer 時，除 health 外另加 `Authorization` header。
 
 ### 3.1 `GET /v1/health`
 
@@ -83,6 +96,7 @@ hub 目前允許任意 Origin（方便本機 Vite / 靜態站）。生產環境�
 | `port.path` | 真實裝置路徑 |
 | `port.baud` | 鮑率 |
 | `port.connected` | 是否已開啟 |
+| `port.epoch` | 連線世代；每次斷線後重新連線會遞增 |
 | `port.detail` | 狀態說明 |
 | `tx_mode` | 如 `queue_by_line` |
 | `lock_owner` | 寫鎖持有者或 null |
@@ -150,7 +164,8 @@ hub 目前允許任意 Origin（方便本機 Vite / 靜態站）。生產環境�
 {
   "text": "AT",
   "newline": true,
-  "as_client": "web-ui"
+  "as_client": "web-ui",
+  "lease_token": "opaque-random-token-if-a-lease-is-active"
 }
 ```
 
@@ -159,7 +174,8 @@ hub 目前允許任意 Origin（方便本機 Vite / 靜態站）。生產環境�
 ```json
 {
   "hex": "41 54 0d 0a",
-  "as_client": "web-ui"
+  "as_client": "web-ui",
+  "lease_token": "opaque-random-token-if-a-lease-is-active"
 }
 ```
 
@@ -168,7 +184,8 @@ hub 目前允許任意 Origin（方便本機 Vite / 靜態站）。生產環境�
 | `text` | 與 hex 二選一 | UTF-8 文字 |
 | `hex` | 與 text 二選一 | 十六進位（可含空白）；**優先於 text** |
 | `newline` | 否，預設 true | 對 text：若無 `\n` 則自動補上 |
-| `as_client` | 否 | 身分名稱，用於鎖與審計；預設 `api` |
+| `as_client` | 否 | 顯示/審計名稱；預設 `api`，**不是授權憑證** |
+| `lease_token` | 有租約時必填 | `POST /v1/lock` 回傳的不透明 TX Bearer |
 
 **成功：**
 
@@ -184,7 +201,9 @@ hub 目前允許任意 Origin（方便本機 Vite / 靜態站）。生產環境�
 
 **注意（TX 策略）：**
 
-- 預設 `queue_by_line`：未遇到 `\n` 前可能暫存不立刻下發（HTTP 若已補 newline 則整行送出）。  
+- HTTP text/hex 是一次**原子寫入**，不經 delimiter assembler；大小受 `tx.max_write_bytes` 限制。
+- `ok: true` 代表串口所有者已完成主機側 `write_all` + `flush`，不是設備協定 ACK。
+- 入隊與主機寫入確認共用 `tx.write_timeout_ms` 截止時間；若錯誤表示結果可能 partial/unknown，可能已有部分或全部位元組送到驅動，**不可盲目重試**。
 - `exclusive` 模式必須先持有寫鎖。  
 - 多客戶端同時寫：由 hub 仲裁，**不會靜默交錯位元組**。
 
@@ -201,22 +220,41 @@ hub 目前允許任意 Origin（方便本機 Vite / 靜態站）。生產環境�
 **成功：**
 
 ```json
-{ "ok": true, "lock": { "owner": "web-ui", "expires_ms": 3000 } }
+{
+  "ok": true,
+  "lock": {
+    "owner": "web-ui",
+    "expires_ms": 3000,
+    "lease_token": "random-opaque-token"
+  }
+}
 ```
+
+`owner` 僅供顯示/審計；真正授權的是隨機 `lease_token`，同名客戶端不能冒充。token 只在申請/續租回應中出現，不會出現在 `/v1/status`，也不應寫入磁碟或日誌。
+
+在 TTL 到期前續租同一把鎖：
+
+```json
+{ "lease_token": "random-opaque-token" }
+```
+
+成功續租會回傳相同 token 與新的 `expires_ms`。
 
 ---
 
 ### 3.7 `DELETE /v1/lock`
 
-**用途**：釋放寫鎖。Body 可選：
+**用途**：釋放寫鎖。存在有效租約時必須提交它的 token：
 
 ```json
-{ "as_client": "web-ui" }
+{ "lease_token": "random-opaque-token" }
 ```
 
 ```json
 { "ok": true }
 ```
+
+租約只會因 TTL 到期或持 token 主動釋放而結束。HTTP / WS / TCP / PTY 連線斷開、或同名客戶端註銷，均**不會**釋放租約。
 
 ---
 
@@ -228,8 +266,9 @@ hub 目前允許任意 Origin（方便本機 Vite / 靜態站）。生產環境�
 ws://127.0.0.1:8787/v1/stream
 ```
 
-- 每個連線 = 一個獨立 fan-out 客戶端（名稱類似 `ws-<uuid>`）。  
+- 每個連線 = 一個獨立 fan-out 客戶端；名稱由伺服器端 endpoint 配置決定，連線 UUID 僅用於內部 kind/診斷。
 - 可同時開多條 WS，皆收到同一份裝置 RX。  
+- 啟用 Bearer 時，瀏覽器以 `new WebSocket(url, ["bearer", token])` 連線；不要把 token 放在 URL。
 
 ### 4.2 伺服器 → 客戶端（RX）
 
@@ -248,11 +287,16 @@ ws://127.0.0.1:8787/v1/stream
 
 | 訊框類型 | hub 行為 |
 |----------|----------|
-| **Text** | 視為 UTF-8；若無結尾 `\n` 則自動補 `\n`，再走 TX 策略 |
-| **Binary** | 原樣子節送入 TX 策略（`queue_by_line` 時仍可能按 `\n` 組幀） |
+| **Text** | 視為 UTF-8；若無結尾 `\n` 則補上，再走 delimiter 組幀；單幀受 `max_frame_bytes` 限制 |
+| **Binary** | 整個訊框視為一次原子 TX，不經 delimiter 組幀；受 `max_write_bytes` 限制 |
 
-寫入仍受 **can_write / 寫鎖 / exclusive** 限制；被拒時目前 **不回 JSON 錯誤幀**（僅 hub 日誌）。  
-可靠寫入請用 **`POST /v1/write`**（有明確 `ok/error`）。
+寫入仍受 **can_write / 寫租約 / exclusive** 限制；拒絕時伺服器回傳 JSON Text 訊框：
+
+```json
+{ "type": "ohmyserial.error", "ok": false, "error": "..." }
+```
+
+WS TX 成功入隊沒有主機寫入 ACK。需要 `write_all` + `flush` 結果、或需攜帶 `lease_token` 時，請用 **`POST /v1/write`**。
 
 ### 4.4 心跳
 
@@ -261,8 +305,7 @@ ws://127.0.0.1:8787/v1/stream
 
 ### 4.5 關閉
 
-關閉 WS 即註銷客戶端；若持有寫鎖且 owner 為該客戶端名稱，鎖會釋放。  
-（HTTP 申請的鎖 owner 為 `as_client` 字串，與 WS 隨機名不同。）
+關閉 WS 會註銷 fan-out 客戶端並關閉它的有界 RX queue，但不會按名稱釋放租約。
 
 ---
 
@@ -286,10 +329,13 @@ ws://127.0.0.1:8787/v1/stream
 ## 6. 錯誤與限制（實作者必讀）
 
 1. **無訊息邊界**：串口為位元組流；`\n` 只是預設 TX 組幀策略。  
-2. **慢客戶端**：預設 `drop_oldest`，網頁卡頓可能丟中間 RX。  
+2. **慢客戶端**：每個讀端都有 `client_queue` 有界 queue。`drop_oldest` 丟最舊待處理塊；`drop_newest` 丟新塊；`disconnect_slow` 立即斷線；`block` 最多等 `slow_block_ms`，逾時亦斷線。
 3. **混合內容**：HTTPS 站連本機 `ws://` 可能失敗。  
 4. **發現**：無 mDNS；請固定埠或手動設定。  
-5. **安全**：能寫串口 ≈ 能碰硬體；僅信任本機 UI。  
+5. **安全**：能寫串口 ≈ 能碰硬體。API 使用 Bearer + 權限；原始 TCP 沒有此鑑權，請只綁回環並用 `ssh -L 8788:127.0.0.1:8788 user@host` 遠端轉發。
+6. **重連隔離**：寫入帶連線 epoch，串口所有者在真正寫入前再驗證；斷線/重連後舊 queue 資料會被拒絕，不會回放至新連線。
+7. **生命週期**：配置或 listener bind 失敗會讓啟動整體失敗並撤銷已啟動 task；正常 shutdown 會停止串口所有者、關閉 fan-out、拒絕/排空待寫資料。
+8. **mock 邊界**：`mock:demo` 可驗證 hub、策略、租約與 API，但不能證明 OS 串口 driver、USB/UART 時序、控制線或真實設備 ACK 正確。
 
 ---
 
@@ -305,9 +351,10 @@ curl -s -X POST http://127.0.0.1:8787/v1/write \
 curl -s -X POST http://127.0.0.1:8787/v1/lock \
   -H 'content-type: application/json' \
   -d '{"as_client":"web-ui"}'
+# 從上一步回應保存 .lock.lease_token，再帶 token 寫入、續租或釋放。
 curl -s -X DELETE http://127.0.0.1:8787/v1/lock \
   -H 'content-type: application/json' \
-  -d '{"as_client":"web-ui"}'
+  -d '{"lease_token":"<saved-token>"}'
 ```
 
 ---

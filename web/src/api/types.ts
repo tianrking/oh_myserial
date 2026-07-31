@@ -7,6 +7,7 @@ export interface PortStatus {
   baud: number;
   connected: boolean;
   detail: string;
+  epoch: number;
 }
 
 export interface Endpoint {
@@ -24,6 +25,7 @@ export interface ClientInfo {
   kind: string;
   can_read: boolean;
   can_write: boolean;
+  primary_eligible: boolean;
 }
 
 export interface Stats {
@@ -58,7 +60,7 @@ export interface WriteResponse {
 export interface LockResponse {
   ok: boolean;
   error?: string;
-  lock?: { owner: string; expires_ms: number };
+  lock?: { owner: string; expires_ms: number; lease_token: string };
 }
 
 export interface HealthResponse {

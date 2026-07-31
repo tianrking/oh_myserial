@@ -254,9 +254,12 @@ ohmyserial/
 
 | 策略 | 含义 |
 |------|------|
-| `drop_oldest`（默认） | 保真口实时性 |
-| `disconnect_slow` | 严格模式 |
-| `block` | 不推荐，仅调试 |
+| `drop_oldest`（默认） | 丢掉该客户端最旧的待处理 RX 块，再放入新块 |
+| `drop_newest` | 保留已排队的数据，丢掉发给该客户端的新块 |
+| `disconnect_slow` | queue 满时立即断开慢客户端 |
+| `block` | 最多阻塞 `slow_block_ms`，仍无空间则断开，禁止无限拖住真口 |
+
+每个 `can_read` 客户端的 pending queue 以 `client_queue` 为硬边界；丢弃、阻塞与慢端断开须分别计数。
 
 ### 10.2 TX
 
@@ -269,10 +272,14 @@ ohmyserial/
 
 **写锁租约（lease）**
 
-- `request_write(client, ttl_ms)`  
-- 到期自动释放  
-- 持锁者崩溃/断开 → 释放  
-- HTTP/WS 控制面可查询 `lock_owner`
+- 首次申请返回随机、不透明的 `lease_token`；`owner` 仅用于显示/审计，不具授权能力
+- 写入、续租和主动释放均以 token 鉴权；同名 client 不能冒充
+- 到期自动释放；客户端断线/註销**不按名称释放**，避免同名连接影响他人租约
+- HTTP/WS 控制面可查询 `lock_owner` 和剩余 TTL，但状态接口不返回 token
+
+HTTP 原子写的 `ok: true` 必须表示串口所有者已完成主机侧 `write_all` + `flush`，而非仅仅入队；它不等于设备协议 ACK。入队和确认共用 `write_timeout_ms`。若 host write 失败或 ACK 超时，结果可能 partial/unknown，调用者不得盲重试。
+
+流式 delimiter 组帧受 `max_frame_bytes` 限制；HTTP 与 WS Binary 原子写受 `max_write_bytes` 限制。每个串口连接有递增 epoch，写入在真正触发 host write 前重验 epoch、截止时间和租约，断线前的旧 queue 不可在重连后回放。
 
 **冲突结果必须可预期**：拒绝并返回错误，或排队；**禁止静默字节交错**。
 
@@ -340,7 +347,12 @@ reconnect_ms = 1000
 mode = "queue_by_line"            # exclusive | queue_by_line | queue_by_frame | primary_wins
 primary = "ui"
 write_lock_ms = 3000
+write_timeout_ms = 5000
+max_frame_bytes = 65536
+max_write_bytes = 65536
 slow_client = "drop_oldest"
+client_queue = 256
+slow_block_ms = 1000
 
 [[clients]]
 name = "ui"
@@ -354,6 +366,14 @@ type = "websocket"
 bind = "127.0.0.1:8787"
 can_write = true
 history_bytes = 65536
+
+[api]
+bind = "127.0.0.1:8787"
+enabled = true
+can_read = true
+can_write = true
+# token_env = "OHMYSERIAL_API_TOKEN"
+# cors_origins = ["https://serial-console.example.com"]
 
 [log]
 file = "logs/session.blog"
@@ -371,13 +391,15 @@ format = "hex+text"               # text | hex | hex+text
 |------|------|
 | `GET /v1/status` | 真口状态、波特率、客户端、锁 |
 | `GET /v1/clients` | 列表 |
-| `POST /v1/write` | body=bytes/text，可选 `wait_lock` |
-| `POST /v1/lock` | 申请写锁 |
-| `DELETE /v1/lock` | 释放 |
+| `POST /v1/write` | 原子 text/hex；租约有效时携带 `lease_token`；等待 host write + flush |
+| `POST /v1/lock` | 无 token 时申请；带 `lease_token` 时续租 |
+| `DELETE /v1/lock` | 带 `lease_token` 释放 |
 | `WS /v1/stream` | 二进制 RX；可选带侧信道事件 |
 | `GET /v1/health` | liveness |
 
-安全默认：**只绑 `127.0.0.1`**；若绑 `0.0.0.0` 必须显式，并警告无鉴权风险（鉴权可后置）。
+安全默认：**只绑 `127.0.0.1`**。明文 API / 独立 WS 即使配置 Bearer 也拒绝非回环监听，远程访问走 SSH tunnel 或 TLS reverse proxy；`token_env` 密钥仅从环境变量读取，除 health 外的 `/v1/*` 使用 Bearer。HTTP/WS 同时校验实际监听 Host，阻断 DNS rebinding；浏览器 CORS 默认同源，白名单必须精确匹配并拒绝 `*`，浏览器 Bearer 使用 `Sec-WebSocket-Protocol: bearer, <token>`，不使用 query token。
+
+原始 TCP 没有 API Bearer 握手，必须保持 loopback；远程协作使用 SSH tunnel，而不是把 raw TCP 直接暴露到 LAN/WAN。
 
 ---
 
@@ -415,11 +437,15 @@ format = "hex+text"               # text | hex | hex+text
 
 | 风险 | 对策 |
 |------|------|
-| 局域网任意人写串口 | 默认 localhost；后续 token |
+| 局域网任意人写串口 | 所有明文监听只走 loopback；远程使用 SSH/TLS；可叠加环境变量 Bearer；校验 Host 防 DNS rebinding |
 | 两客户端命令互毁 | TX 策略 + 权限 + 写锁 |
 | 慢客户端内存爆 | 有界队列 + drop 策略 |
 | 日志含密钥/token | 文档警示；可选 redact 插件后置 |
 | 路径错误打开错误设备 | 启动前 list + 确认；配置显式 path |
+
+启动/关闭也属于可信边界：配置先校验、listener 先完成 bind；任一启动失败要撤销已启动 task。资源由 owner/registration guard 回收，shutdown 要关闭 fan-out、停止串口线程，并把未写 queue 明确拒绝/排空，禁止留下 detached worker。
+
+`mock:demo` 测试只能证明 hub、策略、租约、API 与生命周期逻辑；不能据此宣称 OS 串口 driver、USB/UART 时序、物理控制线或真实设备 ACK 已验证。
 
 ---
 

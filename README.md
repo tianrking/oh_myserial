@@ -374,12 +374,25 @@ Keep `path = "mock:demo"`. Writes loop back as RX (great for tests).
 ### Scenario D — Agent-only write with lock
 
 ```bash
+LEASE_TOKEN="$(curl -s -X POST http://127.0.0.1:8787/v1/lock \
+  -H 'content-type: application/json' \
+  -d '{"as_client":"agent"}' | jq -r '.lock.lease_token')"
+
+curl -s -X POST http://127.0.0.1:8787/v1/write \
+  -H 'content-type: application/json' \
+  -d "{\"text\":\"AT\",\"newline\":true,\"as_client\":\"agent\",\"lease_token\":\"$LEASE_TOKEN\"}"
+
+# Renew the same lease before its TTL expires.
 curl -s -X POST http://127.0.0.1:8787/v1/lock \
   -H 'content-type: application/json' \
-  -d '{"as_client":"agent"}'
-# ... exclusive window ...
-curl -s -X DELETE http://127.0.0.1:8787/v1/lock
+  -d "{\"lease_token\":\"$LEASE_TOKEN\"}"
+
+curl -s -X DELETE http://127.0.0.1:8787/v1/lock \
+  -H 'content-type: application/json' \
+  -d "{\"lease_token\":\"$LEASE_TOKEN\"}"
 ```
+
+`as_client` is an audit/display name, not a credential. Keep the opaque lease token secret; a client using the same name cannot impersonate the lease holder.
 
 ---
 
@@ -408,11 +421,21 @@ reconnect = true
 [tx]
 mode = "queue_by_line"
 write_lock_ms = 3000
+write_timeout_ms = 5000
+max_frame_bytes = 65536
+max_write_bytes = 65536
 primary = "ui"
+slow_client = "drop_oldest"
+client_queue = 256
+slow_block_ms = 1000
 
 [api]
 bind = "127.0.0.1:8787"
 enabled = true
+can_read = true
+can_write = true
+# token_env = "OHMYSERIAL_API_TOKEN"
+# cors_origins = ["https://serial-console.example.com"]
 
 [fanout]
 pty_count = 0               # set 2+ on macOS/Linux for multi serial GUI
@@ -437,8 +460,13 @@ format = "hex+text"
 |-------|---------|
 | `real.path` | Device path or `mock:name` |
 | `tx.mode` | Concurrent write policy |
+| `tx.write_timeout_ms` | End-to-end queue + confirmed host-write deadline |
+| `tx.max_frame_bytes` / `max_write_bytes` | Bounds buffered stream frames and atomic writes |
+| `tx.slow_client` / `client_queue` / `slow_block_ms` | Per-reader RX backpressure policy and bounds |
 | `fanout.*` | Auto-create many parallel endpoints |
-| `api.bind` | HTTP/WS (prefer localhost); unlimited WS clients on `/v1/stream` |
+| `api.bind` | HTTP/WS; plaintext listeners are restricted to loopback |
+| `api.token_env` | Name of the environment variable containing the API bearer secret |
+| `api.cors_origins` | Exact browser origins; empty means same-origin only, and `*` is rejected |
 | `clients[]` | Explicit endpoints (optional) |
 
 ---
@@ -461,6 +489,10 @@ RUST_LOG=debug ohmyserial run -c ohmyserial.toml
 ## HTTP & WebSocket API
 
 **Base:** `http://127.0.0.1:8787` (default)
+
+The plaintext API and dedicated WebSocket listeners are loopback-only. If `api.token_env` is configured, every `/v1/*` route except `/v1/health` requires `Authorization: Bearer <token>`. The secret is read from that environment variable and must not be placed in TOML or URLs. A token does not make cleartext `http://` or `ws://` safe on a network, so non-loopback binds are rejected even when a token exists. Use an SSH tunnel, or place a TLS reverse proxy in front of the loopback listener.
+
+Browser access is same-origin by default. Requests must also carry a Host authority valid for the actual loopback listener, which blocks DNS-rebinding aliases. `api.cors_origins` enables only the exact listed origins; wildcard CORS is rejected. WebSocket upgrades independently require a same-host or listed `Origin`. A browser supplies its bearer as `new WebSocket(url, ["bearer", token])`; query-string tokens are not supported. Non-browser clients may omit `Origin`, but still need the bearer when authentication is enabled.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -487,6 +519,10 @@ curl -s -X POST http://127.0.0.1:8787/v1/write \
   -d '{"hex":"41 54 0d 0a","as_client":"agent"}'
 ```
 
+HTTP text and hex writes are one atomic command, independent of delimiter framing. `ok: true` means the serial-owner thread completed the host-side `write_all` and `flush`; it does **not** mean the device parsed or acknowledged the command. Queue admission and that acknowledgement share the `tx.write_timeout_ms` deadline. If an error says the outcome may be partial or unknown, do not blindly retry—the driver may have written some or all bytes before reporting failure or timing out.
+
+When a write lease is active, include its `lease_token` in the request. Acquire it with `POST /v1/lock`, renew it by posting the token to the same route, and release it with `DELETE /v1/lock`. The token is returned only on acquire/renew and is never included in status output.
+
 ### WebSocket
 
 ```text
@@ -494,11 +530,21 @@ ws://127.0.0.1:8787/v1/stream
 ```
 
 - Server → client: binary RX (history may be sent first)  
-- Client → server: text/binary TX (policy + lock apply)
+- Client → server text: newline-completed stream TX (framed by the configured policy)
+- Client → server binary: one atomic TX command, bounded by `tx.max_write_bytes`
+
+Denied WebSocket writes receive a JSON text error frame (`type = "ohmyserial.error"`). WebSocket admission is not a device-write acknowledgement; use `POST /v1/write` when the caller must wait for the host write + flush result.
 
 ### TCP
 
 ```bash
+nc 127.0.0.1 8788
+```
+
+Raw TCP has no API bearer handshake. Keep it bound to loopback and use an SSH tunnel for remote access:
+
+```bash
+ssh -L 8788:127.0.0.1:8788 user@device-host
 nc 127.0.0.1 8788
 ```
 
@@ -527,9 +573,20 @@ print(urllib.request.urlopen(req).read().decode())
 | `exclusive` | TX only with active write lock | Flash / critical ops |
 | `primary_wins` | Prefer `tx.primary` client | Human-in-the-loop |
 
-While a **write lock** is held, only the owner may TX. Lease ends on timeout, release, or disconnect.
+While a **write lease** is active, only a request carrying its random `lease_token` may TX. The owner string is for display/audit only. A lease ends on TTL expiry or token-authenticated release; disconnecting a same-named HTTP, WebSocket, TCP, or PTY client does not release it.
 
-`slow_client = drop_oldest` (default) protects real-time device reading.
+Every readable client has a bounded RX queue (`client_queue`, in chunks):
+
+| `slow_client` | Queue-full behavior |
+|---------------|---------------------|
+| `drop_oldest` **(default)** | Evict that client's oldest pending RX chunk and enqueue the new chunk |
+| `drop_newest` | Keep queued data and discard the new chunk for that client |
+| `disconnect_slow` | Disconnect the slow client immediately |
+| `block` | Wait up to `slow_block_ms`; disconnect if capacity is still unavailable |
+
+`queue_by_line` / `queue_by_frame` buffering is capped by `max_frame_bytes`; atomic HTTP/WS-binary writes are capped by `max_write_bytes`. Writes admitted while connected carry a connection epoch and are revalidated immediately before the host write. Disconnect/reconnect changes the epoch, so stale queued bytes are rejected instead of replayed into a new device session.
+
+Configuration and listener binds are validated during startup. A bind failure fails the hub startup and tears down already-started tasks. Shutdown closes client fan-out, stops the serial owner, and rejects/drains queued writes rather than leaving detached workers.
 
 ---
 
@@ -566,7 +623,7 @@ Open `/tmp/ohmyserial-ui` in minicom, screen, Serial Studio, etc.
 
 - Default binds are **localhost only** (`127.0.0.1`)  
 - Serial TX can reset boards / send dangerous commands — treat as privileged  
-- Do not bind `0.0.0.0` on untrusted networks without auth (auth is post-MVP)  
+- Plaintext API, WebSocket, and raw TCP listeners are loopback-only; use SSH or a TLS reverse proxy for remote access
 - Logs may contain secrets from the device stream  
 
 ---
@@ -649,7 +706,7 @@ The hub owns the real port settings.
 No. It is an interactive **share hub** with TX control, not passive capture only.
 
 **Does mock mode need hardware?**  
-No. `mock:demo` loops TX back as RX.
+No. `mock:demo` loops TX back as RX. It exercises hub, policy, lease, API, and shutdown logic, but it does **not** validate an OS serial driver, USB/UART timing, physical control lines, or a real device's command acknowledgement.
 
 ---
 

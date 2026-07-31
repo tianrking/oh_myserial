@@ -8,7 +8,7 @@ use crate::policy::Policy;
 use crate::serial::SerialHub;
 
 #[cfg(unix)]
-use crate::client::spawn_pty_client;
+use crate::client::{prepare_pty_client, PreparedPtyClient};
 
 pub struct HubHandle {
     serial: SerialHub,
@@ -16,16 +16,54 @@ pub struct HubHandle {
     pub broker: Broker,
 }
 
-impl HubHandle {
-    pub fn shutdown(self) {
-        self.serial.stop();
-        for t in self.tasks {
-            t.abort();
+struct StartupTasks(Vec<tokio::task::JoinHandle<()>>);
+
+impl StartupTasks {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn push(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.0.push(task);
+    }
+
+    fn finish(mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for StartupTasks {
+    fn drop(&mut self) {
+        for task in self.0.drain(..) {
+            task.abort();
         }
     }
 }
 
+impl HubHandle {
+    fn stop_all(&mut self) {
+        for t in self.tasks.drain(..) {
+            t.abort();
+        }
+        self.serial.stop();
+    }
+
+    pub fn shutdown(mut self) {
+        self.stop_all();
+    }
+}
+
+impl Drop for HubHandle {
+    fn drop(&mut self) {
+        self.stop_all();
+    }
+}
+
 pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
+    // Re-validate at the process boundary so embedders cannot bypass remote
+    // bind authentication requirements by constructing Config directly.
+    cfg.validate()?;
+    let bearer_token = resolve_bearer_token(&cfg)?;
     let policy = Policy::from_config(&cfg.tx)?;
     let log = SessionLog::from_config(&cfg.log)?;
     log.event("hub_starting");
@@ -81,19 +119,40 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
     }
     broker.set_endpoints(endpoints);
 
-    let serial = SerialHub::start(cfg.real.clone(), broker.clone(), serial_rx);
-
-    let mut tasks = Vec::new();
+    // Until startup completes this guard aborts every already-started endpoint
+    // if a later bind fails.
+    let mut tasks = StartupTasks::new();
+    #[cfg(unix)]
+    let mut prepared_ptys = Vec::<PreparedPtyClient>::new();
 
     // Global API (HTTP/WS) — one bind, unlimited concurrent WebSocket monitors/agents.
     if cfg.api.enabled {
-        let history = history_cap.max(0);
+        let (ws_writer, ws_can_read, ws_can_write, history) = cfg
+            .global_websocket_client()
+            .map(|(name, can_read, can_write, history)| {
+                (name.to_owned(), can_read, can_write, history)
+            })
+            .unwrap_or_else(|| {
+                (
+                    "api".to_owned(),
+                    cfg.api.can_read,
+                    cfg.api.can_write,
+                    history_cap,
+                )
+            });
         let st = ApiState {
             broker: broker.clone(),
             default_writer: "api".into(),
+            ws_writer,
             history_on_ws_connect: history,
+            bearer_token: bearer_token.clone(),
+            cors_origins: cfg.api.cors_origins.clone(),
+            can_read: cfg.api.can_read,
+            can_write: cfg.api.can_write,
+            ws_can_read,
+            ws_can_write,
         };
-        tasks.push(spawn_api_server(st, cfg.api.bind.clone()));
+        tasks.push(spawn_api_server(st, cfg.api.bind.clone()).await?);
     }
 
     for client in &cfg.clients {
@@ -104,19 +163,22 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
                 can_write,
                 can_read,
             } => {
-                tasks.push(spawn_tcp_listener(
-                    broker.clone(),
-                    name.clone(),
-                    bind.clone(),
-                    *can_read,
-                    *can_write,
-                ));
+                tasks.push(
+                    spawn_tcp_listener(
+                        broker.clone(),
+                        name.clone(),
+                        bind.clone(),
+                        *can_read,
+                        *can_write,
+                    )
+                    .await?,
+                );
             }
             ClientConfig::Websocket {
                 name,
                 bind,
-                can_write: _,
-                can_read: _,
+                can_write,
+                can_read,
                 history_bytes,
             } => {
                 // Dedicated bind if provided and different from api — otherwise API covers WS.
@@ -125,9 +187,16 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
                         let st = ApiState {
                             broker: broker.clone(),
                             default_writer: name.clone(),
+                            ws_writer: name.clone(),
                             history_on_ws_connect: *history_bytes,
+                            bearer_token: bearer_token.clone(),
+                            cors_origins: cfg.api.cors_origins.clone(),
+                            can_read: *can_read,
+                            can_write: *can_write,
+                            ws_can_read: *can_read,
+                            ws_can_write: *can_write,
                         };
-                        tasks.push(spawn_api_server(st, bind.clone()));
+                        tasks.push(spawn_api_server(st, bind.clone()).await?);
                     } else {
                         tracing::info!(
                             "websocket client '{name}' served by global api on {}",
@@ -149,13 +218,13 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
             } => {
                 #[cfg(unix)]
                 {
-                    tasks.push(spawn_pty_client(
+                    prepared_ptys.push(prepare_pty_client(
                         broker.clone(),
                         name.clone(),
                         link.clone(),
                         *can_read,
                         *can_write,
-                    ));
+                    )?);
                 }
                 #[cfg(not(unix))]
                 {
@@ -164,6 +233,15 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
                 }
             }
         }
+    }
+
+    // No real serial handle is opened until every listener has bound and every
+    // PTY has completed its fallible OS setup. A later startup error therefore
+    // cannot pulse DTR/reset a device and then leave the advertised hub dead.
+    let serial = SerialHub::start(cfg.real.clone(), broker.clone(), serial_rx)?;
+    #[cfg(unix)]
+    for prepared in prepared_ptys {
+        tasks.push(prepared.start());
     }
 
     // Give mock/serial a moment to open.
@@ -180,7 +258,27 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
 
     Ok(HubHandle {
         serial,
-        tasks,
+        tasks: tasks.finish(),
         broker,
     })
+}
+
+fn resolve_bearer_token(cfg: &Config) -> anyhow::Result<Option<String>> {
+    let Some(name) = cfg.api.token_env.as_deref() else {
+        return Ok(None);
+    };
+    let name = name.trim();
+    let token = std::env::var(name).map_err(|_| {
+        anyhow::anyhow!("api.token_env variable '{name}' is missing or not Unicode")
+    })?;
+    if token.is_empty()
+        || !token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.' | '_' | '~'))
+    {
+        anyhow::bail!(
+            "api.token_env variable '{name}' must contain a non-empty URL-safe token (letters, digits, '-', '.', '_', '~')"
+        );
+    }
+    Ok(Some(token))
 }

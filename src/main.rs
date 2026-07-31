@@ -209,7 +209,11 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Status { api, endpoints } => {
-            let path = if endpoints { "/v1/endpoints" } else { "/v1/status" };
+            let path = if endpoints {
+                "/v1/endpoints"
+            } else {
+                "/v1/status"
+            };
             let url = format!("{}{}", api.trim_end_matches('/'), path);
             let body = simple_http_get(&url).await?;
             println!("{body}");
@@ -262,9 +266,7 @@ async fn simple_http_get(url: &str) -> anyhow::Result<String> {
     let stream = tokio::net::TcpStream::connect(host_port).await?;
     let mut stream = stream;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n"
-    );
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;

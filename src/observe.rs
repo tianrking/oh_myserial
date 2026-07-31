@@ -61,12 +61,7 @@ impl SessionLog {
                     std::fs::create_dir_all(parent)?;
                 }
             }
-            Some(
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)?,
-            )
+            Some(OpenOptions::new().create(true).append(true).open(path)?)
         } else {
             None
         };
@@ -102,7 +97,11 @@ impl SessionLog {
                 format!("{ts} {} {who} {}\n", dir.tag(), text.escape_debug())
             }
             LogFormat::Hex => {
-                format!("{ts} {} {who} {}\n", dir.tag(), hex_preview(data, usize::MAX))
+                format!(
+                    "{ts} {} {who} {}\n",
+                    dir.tag(),
+                    hex_preview(data, usize::MAX)
+                )
             }
             LogFormat::HexText => {
                 let text = String::from_utf8_lossy(data);

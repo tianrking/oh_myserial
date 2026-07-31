@@ -103,15 +103,28 @@ pub struct TxConfig {
     pub primary: Option<String>,
     #[serde(default = "default_write_lock_ms")]
     pub write_lock_ms: u64,
+    /// End-to-end deadline for queue admission and confirmed host writes.
+    #[serde(default = "default_write_timeout_ms")]
+    pub write_timeout_ms: u64,
+    /// Maximum bytes retained for one delimiter-framed client command.
+    #[serde(default = "default_max_frame_bytes")]
+    pub max_frame_bytes: usize,
+    /// Maximum bytes accepted by one atomic write.
+    #[serde(default = "default_max_write_bytes")]
+    pub max_write_bytes: usize,
     /// Frame delimiter byte when mode is `queue_by_frame` (default 0x0A = '\n').
     #[serde(default = "default_frame_delim")]
     pub frame_delim: u8,
-    /// Slow client RX strategy: `drop_oldest` | `disconnect_slow` | `block`
+    /// Slow client RX strategy: `drop_oldest` | `drop_newest` | `disconnect_slow` | `block`
     #[serde(default = "default_slow_client")]
     pub slow_client: String,
     /// Per-client outbound queue capacity (chunks).
     #[serde(default = "default_client_queue")]
     pub client_queue: usize,
+    /// Maximum time `slow_client = "block"` may stall fan-out before the slow
+    /// client is disconnected to protect the serial owner.
+    #[serde(default = "default_slow_block_ms")]
+    pub slow_block_ms: u64,
 }
 
 impl Default for TxConfig {
@@ -120,9 +133,13 @@ impl Default for TxConfig {
             mode: default_tx_mode(),
             primary: None,
             write_lock_ms: default_write_lock_ms(),
+            write_timeout_ms: default_write_timeout_ms(),
+            max_frame_bytes: default_max_frame_bytes(),
+            max_write_bytes: default_max_write_bytes(),
             frame_delim: default_frame_delim(),
             slow_client: default_slow_client(),
             client_queue: default_client_queue(),
+            slow_block_ms: default_slow_block_ms(),
         }
     }
 }
@@ -203,6 +220,20 @@ pub struct ApiConfig {
     /// Enable HTTP/WS API server (status, write, lock, stream).
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Environment variable containing the bearer token. The token itself is
+    /// deliberately never accepted in TOML.
+    #[serde(default)]
+    pub token_env: Option<String>,
+    /// Explicit cross-origin browser origins. An empty list is same-origin
+    /// only; wildcard origins are intentionally unsupported.
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+    /// Permit status/history/RX access through this API listener.
+    #[serde(default = "default_true")]
+    pub can_read: bool,
+    /// Permit write/lease/TX access through this API listener.
+    #[serde(default = "default_true")]
+    pub can_write: bool,
 }
 
 impl Default for ApiConfig {
@@ -210,6 +241,10 @@ impl Default for ApiConfig {
         Self {
             bind: default_api_bind(),
             enabled: true,
+            token_env: None,
+            cors_origins: Vec::new(),
+            can_read: true,
+            can_write: true,
         }
     }
 }
@@ -294,6 +329,27 @@ fn default_friendly_pty_count() -> u32 {
 }
 
 impl Config {
+    /// WebSocket identity served by the global API listener, if explicitly
+    /// configured. A single `/v1/stream` route cannot truthfully represent
+    /// more than one configured identity/permission set.
+    pub(crate) fn global_websocket_client(&self) -> Option<(&str, bool, bool, usize)> {
+        if !self.api.enabled {
+            return None;
+        }
+        self.clients.iter().find_map(|client| match client {
+            ClientConfig::Websocket {
+                name,
+                bind,
+                can_write,
+                can_read,
+                history_bytes,
+            } if bind.as_ref().is_none_or(|bind| bind == &self.api.bind) => {
+                Some((name.as_str(), *can_read, *can_write, *history_bytes))
+            }
+            _ => None,
+        })
+    }
+
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let mut cfg: Config = toml::from_str(&text)?;
@@ -344,6 +400,10 @@ impl Config {
             api: ApiConfig {
                 bind: q.api_bind,
                 enabled: true,
+                token_env: None,
+                cors_origins: Vec::new(),
+                can_read: true,
+                can_write: true,
             },
         };
         cfg.expand_fanout()?;
@@ -405,6 +465,7 @@ impl Config {
     /// Expand `[fanout]` into concrete `[[clients]]` entries (idempotent names).
     pub fn expand_fanout(&mut self) -> anyhow::Result<()> {
         let f = self.fanout.clone();
+        #[cfg(unix)]
         let existing: std::collections::HashSet<String> =
             self.clients.iter().map(|c| c.name().to_string()).collect();
 
@@ -421,9 +482,7 @@ impl Config {
             {
                 for i in 0..f.pty_count {
                     let name = format!("{}{}", f.pty_name_prefix, i);
-                    if existing.contains(&name)
-                        || self.clients.iter().any(|c| c.name() == name)
-                    {
+                    if existing.contains(&name) || self.clients.iter().any(|c| c.name() == name) {
                         continue;
                     }
                     let link = PathBuf::from(format!("{}{}", f.pty_link_prefix, i));
@@ -482,16 +541,20 @@ impl Config {
                 kind: "http".into(),
                 name: "api".into(),
                 address: format!("http://{}", self.api.bind),
-                can_read: true,
-                can_write: true,
+                can_read: self.api.can_read,
+                can_write: self.api.can_write,
                 note: "control plane; unlimited concurrent WS on /v1/stream".into(),
             });
+            let (stream_name, stream_can_read, stream_can_write) = self
+                .global_websocket_client()
+                .map(|(name, can_read, can_write, _)| (name, can_read, can_write))
+                .unwrap_or(("api-stream", self.api.can_read, self.api.can_write));
             out.push(EndpointDesc {
                 kind: "websocket".into(),
-                name: "api-stream".into(),
+                name: stream_name.into(),
                 address: format!("ws://{}/v1/stream", self.api.bind),
-                can_read: true,
-                can_write: true,
+                can_read: stream_can_read,
+                can_write: stream_can_write,
                 note: "many agents/tools can connect at once; full RX fan-out".into(),
             });
         }
@@ -530,6 +593,11 @@ impl Config {
                     can_read,
                     ..
                 } => {
+                    let served_by_global_api =
+                        self.api.enabled && bind.as_ref().is_none_or(|bind| bind == &self.api.bind);
+                    if served_by_global_api {
+                        continue;
+                    }
                     let addr = bind
                         .as_ref()
                         .map(|b| format!("ws://{b}/v1/stream"))
@@ -556,13 +624,69 @@ impl Config {
         if self.real.path.trim().is_empty() {
             anyhow::bail!("real.path must not be empty");
         }
+        let token_env = self.api.token_env.as_deref().map(str::trim);
+        if self.api.token_env.is_some() && token_env.is_some_and(str::is_empty) {
+            anyhow::bail!("api.token_env must not be empty");
+        }
+        if token_env.is_some_and(|name| name.contains('=') || name.contains('\0')) {
+            anyhow::bail!("api.token_env is not a valid environment variable name");
+        }
+        if self.api.enabled {
+            let api_addr = parse_api_bind(&self.api.bind, "api.bind")?;
+            if !api_addr.ip().is_loopback() {
+                anyhow::bail!(
+                    "plaintext HTTP/WebSocket API must bind to loopback; use an SSH tunnel or a TLS reverse proxy ({})",
+                    self.api.bind
+                );
+            }
+            let global_websocket_count = self
+                .clients
+                .iter()
+                .filter(|client| {
+                    matches!(
+                        client,
+                        ClientConfig::Websocket { bind, .. }
+                            if bind.as_ref().is_none_or(|bind| bind == &self.api.bind)
+                    )
+                })
+                .count();
+            if global_websocket_count > 1 {
+                anyhow::bail!(
+                    "at most one websocket client may use the global api /v1/stream route"
+                );
+            }
+        }
+        for origin in &self.api.cors_origins {
+            validate_cors_origin(origin)?;
+        }
+        for bind in &self.fanout.ws_binds {
+            validate_websocket_bind_security(bind)?;
+        }
         match self.tx.mode.as_str() {
             "queue_by_line" | "queue_by_frame" | "exclusive" | "primary_wins" => {}
             other => anyhow::bail!("unknown tx.mode: {other}"),
         }
         match self.tx.slow_client.as_str() {
-            "drop_oldest" | "disconnect_slow" | "block" => {}
+            "drop_oldest" | "drop_newest" | "disconnect_slow" | "block" => {}
             other => anyhow::bail!("unknown tx.slow_client: {other}"),
+        }
+        if self.tx.client_queue == 0 {
+            anyhow::bail!("tx.client_queue must be at least 1");
+        }
+        if self.tx.write_lock_ms == 0 {
+            anyhow::bail!("tx.write_lock_ms must be at least 1");
+        }
+        if self.tx.write_timeout_ms == 0 {
+            anyhow::bail!("tx.write_timeout_ms must be at least 1");
+        }
+        if self.tx.max_frame_bytes == 0 {
+            anyhow::bail!("tx.max_frame_bytes must be at least 1");
+        }
+        if self.tx.max_write_bytes == 0 {
+            anyhow::bail!("tx.max_write_bytes must be at least 1");
+        }
+        if self.tx.slow_block_ms == 0 {
+            anyhow::bail!("tx.slow_block_ms must be at least 1");
         }
         match self.log.format.as_str() {
             "text" | "hex" | "hex+text" => {}
@@ -576,7 +700,7 @@ impl Config {
             "none" | "software" | "hardware" => {}
             other => anyhow::bail!("unknown real.flow: {other}"),
         }
-        if !matches!(self.real.databits, 5 | 6 | 7 | 8) {
+        if !matches!(self.real.databits, 5..=8) {
             anyhow::bail!("real.databits must be 5..=8");
         }
         if !matches!(self.real.stopbits, 1 | 2) {
@@ -585,6 +709,14 @@ impl Config {
 
         let mut names = std::collections::HashSet::new();
         for c in &self.clients {
+            if c.name().trim().is_empty()
+                || c.name().len() > 128
+                || c.name().chars().any(char::is_control)
+            {
+                anyhow::bail!(
+                    "client name must be non-empty, at most 128 bytes, and contain no control characters"
+                );
+            }
             if !names.insert(c.name().to_string()) {
                 anyhow::bail!("duplicate client name: {}", c.name());
             }
@@ -595,9 +727,69 @@ impl Config {
                     c.name()
                 );
             }
+            match c {
+                ClientConfig::Tcp { bind, .. } => {
+                    let addr = parse_api_bind(bind, "tcp bind")?;
+                    if !addr.ip().is_loopback() {
+                        anyhow::bail!(
+                            "raw TCP has no authentication and must bind to loopback; use an SSH tunnel for remote access ({bind})"
+                        );
+                    }
+                }
+                ClientConfig::Websocket {
+                    bind: Some(bind), ..
+                } => validate_websocket_bind_security(bind)?,
+                ClientConfig::Websocket { bind: None, .. } if !self.api.enabled => {
+                    anyhow::bail!(
+                        "websocket client '{}' has no bind while api.enabled=false",
+                        c.name()
+                    );
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
+}
+
+fn parse_api_bind(bind: &str, field: &str) -> anyhow::Result<std::net::SocketAddr> {
+    bind.parse()
+        .map_err(|e| anyhow::anyhow!("invalid {field} '{bind}': {e}"))
+}
+
+fn validate_websocket_bind_security(bind: &str) -> anyhow::Result<()> {
+    let addr = parse_api_bind(bind, "websocket bind")?;
+    if !addr.ip().is_loopback() {
+        anyhow::bail!(
+            "plaintext dedicated WebSocket must bind to loopback; use an SSH tunnel or a TLS reverse proxy ({bind})"
+        );
+    }
+    Ok(())
+}
+
+fn validate_cors_origin(origin: &str) -> anyhow::Result<()> {
+    let trimmed = origin.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        anyhow::bail!("api.cors_origins must contain explicit origins, never wildcard '*'");
+    }
+    if trimmed != origin || trimmed.chars().any(char::is_whitespace) {
+        anyhow::bail!("invalid CORS origin '{origin}'");
+    }
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        anyhow::bail!("CORS origin must start with http:// or https://: '{origin}'");
+    }
+    let authority = trimmed
+        .split_once("://")
+        .map(|(_, authority)| authority)
+        .unwrap_or_default();
+    if authority.is_empty()
+        || authority.contains('/')
+        || authority.contains('?')
+        || authority.contains('#')
+    {
+        anyhow::bail!("CORS value must be an origin without path/query/fragment: '{origin}'");
+    }
+    Ok(())
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -640,6 +832,15 @@ fn default_tx_mode() -> String {
 fn default_write_lock_ms() -> u64 {
     3000
 }
+fn default_write_timeout_ms() -> u64 {
+    5000
+}
+fn default_max_frame_bytes() -> usize {
+    65_536
+}
+fn default_max_write_bytes() -> usize {
+    65_536
+}
 fn default_frame_delim() -> u8 {
     b'\n'
 }
@@ -648,6 +849,9 @@ fn default_slow_client() -> String {
 }
 fn default_client_queue() -> usize {
     256
+}
+fn default_slow_block_ms() -> u64 {
+    1000
 }
 fn default_tcp_bind() -> String {
     "127.0.0.1:8788".into()
@@ -751,7 +955,155 @@ tcp_name_prefix = "m"
             _ => panic!("expected tcp"),
         }
         let eps = cfg.endpoint_catalog();
-        assert!(eps.iter().any(|e| e.kind == "tcp" && e.address.contains("19001")));
+        assert!(eps
+            .iter()
+            .any(|e| e.kind == "tcp" && e.address.contains("19001")));
+    }
+
+    #[test]
+    fn plaintext_non_loopback_api_is_rejected_even_with_a_token() {
+        let mut cfg = Config::default();
+        cfg.api.bind = "0.0.0.0:8787".into();
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("SSH tunnel"), "error={error}");
+
+        cfg.api.token_env = Some("OHMYSERIAL_API_TOKEN".into());
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("TLS reverse proxy"), "error={error}");
+    }
+
+    #[test]
+    fn plaintext_non_loopback_websocket_is_rejected_even_with_a_token() {
+        let mut cfg = Config::default();
+        cfg.clients.push(ClientConfig::Websocket {
+            name: "remote-agent".into(),
+            bind: Some("0.0.0.0:8790".into()),
+            can_write: false,
+            can_read: true,
+            history_bytes: 1024,
+        });
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("SSH tunnel"), "error={error}");
+
+        cfg.api.token_env = Some("OHMYSERIAL_API_TOKEN".into());
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("TLS reverse proxy"), "error={error}");
+    }
+
+    #[test]
+    fn unauthenticated_raw_tcp_must_remain_loopback_only() {
+        let cfg = Config {
+            clients: vec![ClientConfig::Tcp {
+                name: "unsafe-tcp".into(),
+                bind: "0.0.0.0:8788".into(),
+                can_write: true,
+                can_read: true,
+            }],
+            ..Config::default()
+        };
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("SSH tunnel"), "error={error}");
+    }
+
+    #[test]
+    fn websocket_without_bind_requires_global_api() {
+        let mut cfg = Config::default();
+        cfg.api.enabled = false;
+        cfg.clients = vec![ClientConfig::Websocket {
+            name: "missing".into(),
+            bind: None,
+            can_write: false,
+            can_read: true,
+            history_bytes: 1024,
+        }];
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("api.enabled=false"), "error={error}");
+    }
+
+    #[test]
+    fn cors_origins_are_explicit_and_origin_only() {
+        let mut cfg = Config::default();
+        cfg.api.cors_origins = vec!["*".into()];
+        assert!(cfg.validate().unwrap_err().to_string().contains("wildcard"));
+
+        cfg.api.cors_origins = vec!["https://console.example.test/path".into()];
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("without path"));
+
+        cfg.api.cors_origins = vec!["https://console.example.test".into()];
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn global_endpoint_catalog_uses_api_permissions() {
+        let mut cfg = Config::default();
+        cfg.api.can_read = true;
+        cfg.api.can_write = false;
+        let endpoints = cfg.endpoint_catalog();
+        let api = endpoints.iter().find(|ep| ep.name == "api").unwrap();
+        let stream = endpoints.iter().find(|ep| ep.name == "api-stream").unwrap();
+        assert!(api.can_read && !api.can_write);
+        assert!(stream.can_read && !stream.can_write);
+    }
+
+    #[test]
+    fn configured_global_websocket_identity_and_permissions_are_exact() {
+        let mut cfg = Config::default();
+        cfg.api.can_read = false;
+        cfg.api.can_write = true;
+        cfg.clients = vec![ClientConfig::Websocket {
+            name: "agent".into(),
+            bind: None,
+            can_write: false,
+            can_read: true,
+            history_bytes: 2048,
+        }];
+        cfg.validate().unwrap();
+
+        assert_eq!(
+            cfg.global_websocket_client(),
+            Some(("agent", true, false, 2048))
+        );
+        let endpoints = cfg.endpoint_catalog();
+        assert_eq!(
+            endpoints
+                .iter()
+                .filter(|endpoint| endpoint.kind == "websocket")
+                .count(),
+            1
+        );
+        let stream = endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == "websocket")
+            .unwrap();
+        assert_eq!(stream.name, "agent");
+        assert!(stream.can_read && !stream.can_write);
+    }
+
+    #[test]
+    fn global_api_rejects_ambiguous_websocket_identities() {
+        let mut cfg = Config::default();
+        cfg.clients = vec![
+            ClientConfig::Websocket {
+                name: "agent-a".into(),
+                bind: None,
+                can_write: false,
+                can_read: true,
+                history_bytes: 1024,
+            },
+            ClientConfig::Websocket {
+                name: "agent-b".into(),
+                bind: Some(cfg.api.bind.clone()),
+                can_write: true,
+                can_read: true,
+                history_bytes: 1024,
+            },
+        ];
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("at most one websocket client"), "{error}");
     }
 
     #[cfg(unix)]

@@ -5,51 +5,56 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
-use crate::broker::Broker;
+use crate::broker::{Broker, ClientRx};
 
-pub fn spawn_tcp_listener(
+pub async fn spawn_tcp_listener(
     broker: Broker,
     name: String,
     bind: String,
     can_read: bool,
     can_write: bool,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let listener = match TcpListener::bind(&bind).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("tcp bind {bind} failed: {e}");
-                return;
-            }
-        };
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    // Bind eagerly so run_hub can fail atomically instead of advertising a dead
+    // endpoint while the listener task merely logs an error.
+    let listener = TcpListener::bind(&bind)
+        .await
+        .map_err(|e| anyhow::anyhow!("tcp bind {bind} failed: {e}"))?;
+
+    Ok(tokio::spawn(async move {
         tracing::info!("tcp client '{name}' listening on {bind}");
         broker
             .log()
             .event(&format!("tcp_listen name={name} bind={bind}"));
 
+        let mut connections = JoinSet::new();
         loop {
-            match listener.accept().await {
-                Ok((stream, peer)) => {
-                    tracing::info!("tcp '{name}' accept from {peer}");
-                    let broker = broker.clone();
-                    let name = name.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_conn(broker, name, stream, can_read, can_write).await
-                        {
-                            tracing::debug!("tcp connection closed: {e}");
-                        }
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("tcp accept error: {e}");
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, peer)) => {
+                        tracing::info!("tcp '{name}' accept from {peer}");
+                        let broker = broker.clone();
+                        let name = name.clone();
+                        connections.spawn(async move {
+                            if let Err(e) = handle_conn(broker, name, stream, can_read, can_write).await {
+                                tracing::debug!("tcp connection closed: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("tcp accept error: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                },
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(e)) = completed {
+                        tracing::debug!("tcp connection task ended: {e}");
+                    }
                 }
             }
         }
-    })
+    }))
 }
 
 async fn handle_conn(
@@ -59,51 +64,51 @@ async fn handle_conn(
     can_read: bool,
     can_write: bool,
 ) -> anyhow::Result<()> {
+    let peer = stream.peer_addr()?;
     let (id, mut from_broker) =
-        broker.register_client(format!("{name}@{}", stream.peer_addr()?), "tcp", can_read, can_write, None);
+        broker.register_client(name, format!("tcp@{peer}"), can_read, can_write, None);
+    let _registration = broker.client_registration(id);
 
     let (mut reader, mut writer) = stream.into_split();
-    let broker_r = broker.clone();
-
-    let write_task = tokio::spawn(async move {
-        while let Some(data) = from_broker.recv().await {
-            if writer.write_all(&data).await.is_err() {
-                break;
-            }
-        }
-    });
 
     let mut buf = vec![0u8; 4096];
     loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        if can_write {
-            if let Err(e) = broker_r
-                .client_tx(id, Bytes::copy_from_slice(&buf[..n]))
-                .await
-            {
-                tracing::warn!("tcp tx denied: {e}");
-                // surface error as text line to client
-                let msg = format!("!ohmyserial tx denied: {e}\n");
-                // cannot easily write to writer here; ignore
-                let _ = msg;
+        tokio::select! {
+            outbound = from_broker.recv(), if can_read => {
+                match outbound {
+                    Some(data) => writer.write_all(&data).await?,
+                    None => break,
+                }
+            }
+            inbound = reader.read(&mut buf) => {
+                let n = inbound?;
+                if n == 0 {
+                    break;
+                }
+                if !can_write {
+                    writer
+                        .write_all(b"!ohmyserial tx denied: client is read-only\n")
+                        .await?;
+                    continue;
+                }
+                if let Err(e) = broker
+                    .client_tx(id, Bytes::copy_from_slice(&buf[..n]))
+                    .await
+                {
+                    tracing::warn!("tcp tx denied: {e}");
+                    writer
+                        .write_all(format!("!ohmyserial tx denied: {e}\n").as_bytes())
+                        .await?;
+                }
             }
         }
     }
-
-    write_task.abort();
-    broker.unregister_client(id);
     Ok(())
 }
 
 /// Test helper: connect and exchange (not used in production path).
 #[allow(dead_code)]
-pub async fn pipe_channels(
-    mut from_broker: mpsc::Receiver<Bytes>,
-    to_client: Arc<tokio::sync::Mutex<Vec<u8>>>,
-) {
+pub async fn pipe_channels(mut from_broker: ClientRx, to_client: Arc<tokio::sync::Mutex<Vec<u8>>>) {
     while let Some(data) = from_broker.recv().await {
         to_client.lock().await.extend_from_slice(&data);
     }

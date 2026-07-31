@@ -62,6 +62,9 @@ export default function App() {
   const [conn, setConn] = useState<ConnectionConfig>(loadConn);
   const [hostInput, setHostInput] = useState(conn.host);
   const [portInput, setPortInput] = useState(String(conn.port));
+  // Optional remote-API bearer. It is deliberately never persisted.
+  const [apiTokenInput, setApiTokenInput] = useState("");
+  const apiBearerToken = apiTokenInput.trim() || undefined;
 
   const [online, setOnline] = useState(false);
   const [wsOpen, setWsOpen] = useState(false);
@@ -81,6 +84,8 @@ export default function App() {
   const [sendHex, setSendHex] = useState("");
   const [newline, setNewline] = useState(true);
   const [busy, setBusy] = useState(false);
+  // A write lease is a bearer credential: keep it in memory only and never log it.
+  const [leaseToken, setLeaseToken] = useState<string | null>(null);
 
   useEffect(() => {
     pausedRef.current = paused;
@@ -101,10 +106,10 @@ export default function App() {
     });
   }, []);
 
-  const refreshMeta = useCallback(async (cfg: ConnectionConfig) => {
+  const refreshMeta = useCallback(async (cfg: ConnectionConfig, bearerToken?: string) => {
     const [st, ep] = await Promise.all([
-      hubApi.status(cfg),
-      hubApi.endpoints(cfg),
+      hubApi.status(cfg, bearerToken),
+      hubApi.endpoints(cfg, bearerToken),
     ]);
     setStatus(st);
     setEndpoints(ep.endpoints);
@@ -117,6 +122,7 @@ export default function App() {
     wsRef.current = null;
     setWsOpen(false);
     setOnline(false);
+    setLeaseToken(null);
   }, []);
 
   const connect = useCallback(async () => {
@@ -130,37 +136,41 @@ export default function App() {
     setBusy(true);
     try {
       await hubApi.health(cfg);
-      await refreshMeta(cfg);
+      await refreshMeta(cfg, apiBearerToken);
 
       wsRef.current?.close();
-      const ws = connectStream(cfg, {
-        onOpen: () => {
-          setWsOpen(true);
-          pushLog({ kind: "sys", text: `WebSocket 已連線 ${wsUrl(cfg)}` });
+      const ws = connectStream(
+        cfg,
+        {
+          onOpen: () => {
+            setWsOpen(true);
+            pushLog({ kind: "sys", text: `WebSocket 已連線 ${wsUrl(cfg)}` });
+          },
+          onClose: () => {
+            setWsOpen(false);
+            pushLog({ kind: "sys", text: "WebSocket 已關閉" });
+          },
+          onError: () => {
+            pushLog({
+              kind: "err",
+              text: "WebSocket 錯誤（若頁面為 HTTPS，瀏覽器可能封鎖 ws://127.0.0.1）",
+            });
+          },
+          onBytes: (data, meta) => {
+            if (pausedRef.current) return;
+            const text = bytesToText(data);
+            const hex = bytesToHex(data);
+            pushLog({
+              kind: "rx",
+              text: meta.isHistoryHint
+                ? `[歷史?] ${text.replace(/\n/g, "\\n")}`
+                : text.replace(/\n/g, "\\n"),
+              hex,
+            });
+          },
         },
-        onClose: () => {
-          setWsOpen(false);
-          pushLog({ kind: "sys", text: "WebSocket 已關閉" });
-        },
-        onError: () => {
-          pushLog({
-            kind: "err",
-            text: "WebSocket 錯誤（若頁面為 HTTPS，瀏覽器可能封鎖 ws://127.0.0.1）",
-          });
-        },
-        onBytes: (data, meta) => {
-          if (pausedRef.current) return;
-          const text = bytesToText(data);
-          const hex = bytesToHex(data);
-          pushLog({
-            kind: "rx",
-            text: meta.isHistoryHint
-              ? `[歷史?] ${text.replace(/\n/g, "\\n")}`
-              : text.replace(/\n/g, "\\n"),
-            hex,
-          });
-        },
-      });
+        apiBearerToken,
+      );
       wsRef.current = ws;
     } catch (e) {
       setOnline(false);
@@ -172,16 +182,16 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [hostInput, portInput, pushLog, refreshMeta]);
+  }, [apiBearerToken, hostInput, portInput, pushLog, refreshMeta]);
 
   // 定時刷新狀態
   useEffect(() => {
     if (!online) return;
     const t = setInterval(() => {
-      refreshMeta(conn).catch(() => setOnline(false));
+      refreshMeta(conn, apiBearerToken).catch(() => setOnline(false));
     }, 2000);
     return () => clearInterval(t);
-  }, [online, conn, refreshMeta]);
+  }, [apiBearerToken, online, conn, refreshMeta]);
 
   useEffect(() => {
     if (!autoScroll || !logBoxRef.current) return;
@@ -197,6 +207,8 @@ export default function App() {
       const r = await hubApi.writeText(conn, sendText, {
         newline,
         as_client: CLIENT_NAME,
+        lease_token: leaseToken ?? undefined,
+        bearer_token: apiBearerToken,
       });
       if (!r.ok) throw new Error(r.error || "寫入失敗");
       pushLog({
@@ -217,7 +229,11 @@ export default function App() {
     if (!sendHex.trim()) return;
     setBusy(true);
     try {
-      const r = await hubApi.writeHex(conn, sendHex, { as_client: CLIENT_NAME });
+      const r = await hubApi.writeHex(conn, sendHex, {
+        as_client: CLIENT_NAME,
+        lease_token: leaseToken ?? undefined,
+        bearer_token: apiBearerToken,
+      });
       if (!r.ok) throw new Error(r.error || "寫入失敗");
       pushLog({ kind: "tx", text: `HTTP 寫入 hex ${r.bytes} bytes：${sendHex}` });
     } catch (e) {
@@ -233,11 +249,22 @@ export default function App() {
   const onLock = async () => {
     setBusy(true);
     try {
-      const r = await hubApi.lock(conn, CLIENT_NAME);
+      const r = await hubApi.lock(
+        conn,
+        CLIENT_NAME,
+        leaseToken ?? undefined,
+        apiBearerToken,
+      );
       if (!r.ok) throw new Error(r.error || "鎖失敗");
-      pushLog({ kind: "sys", text: `已取得寫鎖：${JSON.stringify(r.lock)}` });
-      await refreshMeta(conn);
+      if (!r.lock) throw new Error("伺服器未回傳租約");
+      setLeaseToken(r.lock.lease_token);
+      pushLog({
+        kind: "sys",
+        text: `已取得寫鎖：${r.lock.owner}（${r.lock.expires_ms} ms）`,
+      });
+      await refreshMeta(conn, apiBearerToken);
     } catch (e) {
+      setLeaseToken(null);
       pushLog({
         kind: "err",
         text: `寫鎖失敗：${e instanceof Error ? e.message : String(e)}`,
@@ -248,12 +275,17 @@ export default function App() {
   };
 
   const onUnlock = async () => {
+    if (!leaseToken) {
+      pushLog({ kind: "err", text: "本頁沒有可釋放的租約令牌" });
+      return;
+    }
     setBusy(true);
     try {
-      const r = await hubApi.unlock(conn, CLIENT_NAME);
+      const r = await hubApi.unlock(conn, leaseToken, apiBearerToken);
       if (!r.ok) throw new Error(r.error || "解鎖失敗");
+      setLeaseToken(null);
       pushLog({ kind: "sys", text: "已釋放寫鎖" });
-      await refreshMeta(conn);
+      await refreshMeta(conn, apiBearerToken);
     } catch (e) {
       pushLog({
         kind: "err",
@@ -310,6 +342,16 @@ export default function App() {
               onChange={(e) => setPortInput(e.target.value)}
               placeholder="8787"
               className="port"
+            />
+          </label>
+          <label>
+            API Token（遠端選填）
+            <input
+              type="password"
+              autoComplete="off"
+              value={apiTokenInput}
+              onChange={(e) => setApiTokenInput(e.target.value)}
+              placeholder="只保存在本頁記憶體"
             />
           </label>
           <button type="button" disabled={busy} onClick={() => void connect()}>

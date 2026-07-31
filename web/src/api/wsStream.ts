@@ -17,9 +17,12 @@ export type StreamHandlers = {
 export function connectStream(
   cfg: ConnectionConfig,
   handlers: StreamHandlers,
+  bearerToken?: string,
 ): WebSocket {
   const url = wsUrl(cfg);
-  const ws = new WebSocket(url);
+  const ws = bearerToken
+    ? new WebSocket(url, ["bearer", bearerToken])
+    : new WebSocket(url);
   ws.binaryType = "arraybuffer";
 
   let firstBinary = true;

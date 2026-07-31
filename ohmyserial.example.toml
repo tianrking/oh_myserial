@@ -22,13 +22,31 @@ reconnect_ms = 1000
 mode = "queue_by_line"
 primary = "ui"
 write_lock_ms = 3000
+write_timeout_ms = 5000
+max_frame_bytes = 65536
+max_write_bytes = 65536
 slow_client = "drop_oldest"
+client_queue = 256
+# Only used by slow_client = "block". A client still full after this deadline
+# is disconnected so it cannot stall the serial owner indefinitely.
+slow_block_ms = 1000
 
 [api]
 bind = "127.0.0.1:8787"
 enabled = true
+can_read = true
+can_write = true
+# The URL-safe secret is read only from this environment variable, never from TOML.
+# token_env = "OHMYSERIAL_API_TOKEN"
+# Empty means same-origin browser access only. List exact origins when needed;
+# wildcard CORS is intentionally rejected.
+# cors_origins = ["https://serial-console.example.com"]
 # Agents: ws://127.0.0.1:8787/v1/stream  (unlimited concurrent connections)
 # List endpoints: GET http://127.0.0.1:8787/v1/endpoints
+# Plaintext API and dedicated WebSocket binds are loopback-only even with a token.
+# For remote access, use an SSH tunnel or a TLS reverse proxy to this listener.
+# HTTP: Authorization: Bearer $OHMYSERIAL_API_TOKEN
+# Browser WS: new WebSocket(url, ["bearer", token])
 
 # ========== bulk fan-out ==========
 [fanout]
@@ -41,7 +59,9 @@ pty_name_prefix = "v"
 pty_can_write = true
 pty_can_read = true
 
-# Two TCP ports; EACH accepts many simultaneous clients (all see the same RX)
+# Two raw, unauthenticated TCP ports; EACH accepts many simultaneous clients.
+# Keep these on loopback. For remote access, tunnel them over SSH instead of
+# binding raw TCP to a LAN/WAN interface.
 tcp_count = 2
 tcp_host = "127.0.0.1"
 tcp_base_port = 8788
