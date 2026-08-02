@@ -533,6 +533,8 @@ Browser access is same-origin by default. Requests must also carry a Host author
 | `POST` | `/v1/workflows/run` | Bounded linear lease/send/expect workflow |
 | `POST` | `/v1/write` | Send text or hex to device |
 | `POST` | `/v1/control` | DTR/RTS/BREAK; requires `can_control` and a lease token |
+| `POST` | `/v1/handoff` | Close the real handle for a bounded external maintenance window |
+| `POST` | `/v1/handoff/resume` | Resume the owner with the one-time handoff token |
 | `POST` | `/v1/lock` | Acquire write lock |
 | `DELETE` | `/v1/lock` | Release write lock |
 | `WS` | `/v1/stream` | Live RX stream |
@@ -562,6 +564,12 @@ Physical control lines are opt-in with `api.can_control = true`. Call
 The serial-owner thread performs the OS operation and acknowledges it; mock
 mode rejects these operations because it has no physical lines. RTS is rejected
 when `real.flow = "hardware"` to avoid fighting the driver's flow-control state.
+
+For tools that must open the physical device themselves, use the bounded
+handoff protocol in [`HANDOFF.md`](./HANDOFF.md). It drains queued writes,
+releases the OS handle before acknowledging, invalidates the old lease, and
+auto-resumes at the TTL if the external tool fails to call `/resume`. The
+handoff token never enters status or the event ledger.
 
 ### WebSocket
 
@@ -749,7 +757,8 @@ CI: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) — Ubuntu, macOS, 
 | ✅ Foundation | Hub core, trusted TX, leases, TCP, HTTP/WS, Unix PTY, mock, logs, CLI |
 | ✅ Evidence | Canonical event ledger, optional hashed segments, query/export/event WS, safe replay |
 | ✅ Automation | Bounded linear workflows with evidence cursors and idempotent request IDs |
-| 🔜 Next | Device identity/control lines, handoff, multi-port supervision |
+| ✅ Delivered | Device identity, control lines, bounded handoff |
+| 🔜 Next | Multi-port supervision |
 | 🧭 Later | RFC2217, Windows COM bridge guide, richer web evidence tooling, metrics |
 
 Not core goals: cloud SaaS, heavy GUI installer, kernel virtual-COM driver (unless demand is clear).

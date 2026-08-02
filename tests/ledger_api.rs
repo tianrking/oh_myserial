@@ -653,3 +653,61 @@ async fn workflow_api_runs_linear_expect_and_is_idempotent_without_token_leak() 
     assert_eq!(replay.json()["result"], response.json()["result"]);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn control_api_requires_capability_lease_and_owner_ack() {
+    let access = ApiAccess {
+        can_control: true,
+        ..ApiAccess::default()
+    };
+    let server = start_server(memory_ledger(64), access).await;
+    let (control_tx, mut control_rx) = mpsc::channel(1);
+    server.broker.attach_serial_control(control_tx);
+
+    let lock = http_request(
+        server.addr,
+        "POST",
+        "/v1/lock",
+        &[("Content-Type", "application/json")],
+        &json!({"as_client": "control-agent"}).to_string(),
+    )
+    .await;
+    let lease_token = lock.json()["lock"]["lease_token"]
+        .as_str()
+        .expect("lease token")
+        .to_owned();
+    let body = json!({
+        "op": "dtr",
+        "level": true,
+        "as_client": "control-agent",
+        "lease_token": lease_token,
+    })
+    .to_string();
+    let request = {
+        let addr = server.addr;
+        tokio::spawn(async move {
+            http_request(
+                addr,
+                "POST",
+                "/v1/control",
+                &[("Content-Type", "application/json")],
+                &body,
+            )
+            .await
+        })
+    };
+    let command = control_rx.recv().await.expect("owner control command");
+    let acknowledgement = match command {
+        ohmyserial::broker::SerialControl::Command {
+            command: ohmyserial::broker::ControlCommand::Dtr(true),
+            acknowledgement,
+        } => acknowledgement,
+        _ => panic!("unexpected control command"),
+    };
+    acknowledgement.send(Ok(())).unwrap();
+    let response = request.await.unwrap();
+    assert_eq!(response.status, 200, "response={response:?}");
+    assert_eq!(response.json()["ok"], true);
+    assert!(!response.body.contains("lease_token"));
+    server.shutdown().await;
+}

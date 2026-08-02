@@ -7,7 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use parking_lot::{Condvar, Mutex};
 use serialport::{DataBits, FlowControl, Parity, SerialPortType, StopBits};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::broker::{Broker, ControlCommand, DeviceWrite, PortStatus, SerialControl};
 use crate::config::RealPortConfig;
@@ -126,7 +126,7 @@ fn serial_thread(
                     .event(&format!("serial_open path={resolved_path}"));
                 backoff = Duration::from_millis(cfg.reconnect_ms.max(50));
 
-                if !io_loop(
+                let outcome = io_loop(
                     &mut *port,
                     &broker,
                     &mut write_rx,
@@ -134,19 +134,42 @@ fn serial_thread(
                     &stop,
                     &cfg.flow,
                     cfg.read_timeout_ms,
-                ) {
-                    break; // shutdown
-                }
-
-                broker.set_port_status(PortStatus {
-                    path: cfg.path.clone(),
-                    baud: cfg.baud,
-                    connected: false,
-                    detail: "disconnected".into(),
-                });
-                broker.log().event("serial_disconnected");
-                if !cfg.reconnect {
-                    break;
+                );
+                match outcome {
+                    IoLoopExit::Stop => break,
+                    IoLoopExit::Reconnect => {
+                        broker.set_port_status(PortStatus {
+                            path: resolved_path.clone(),
+                            baud: cfg.baud,
+                            connected: false,
+                            detail: "disconnected".into(),
+                        });
+                        broker.log().event("serial_disconnected");
+                        if !cfg.reconnect {
+                            break;
+                        }
+                    }
+                    IoLoopExit::Handoff {
+                        duration_ms,
+                        acknowledgement,
+                    } => {
+                        // Do not acknowledge until the Box owning the OS
+                        // handle has been dropped. The external tool must not
+                        // race an open handle during the handoff boundary.
+                        drop(port);
+                        broker.set_port_status(PortStatus {
+                            path: resolved_path,
+                            baud: cfg.baud,
+                            connected: false,
+                            detail: "handoff".into(),
+                        });
+                        broker.log().event("serial_handoff_owner_released");
+                        let _ = acknowledgement.send(Ok(()));
+                        if !wait_handoff(&broker, &mut control_rx, &stop, duration_ms) {
+                            break;
+                        }
+                        continue;
+                    }
                 }
             }
             Err(e) => {
@@ -175,7 +198,17 @@ fn serial_thread(
     });
     close_pending_writes(&broker, &mut write_rx, "serial_stopped");
     drop_pending_controls(&mut control_rx, "serial_stopped");
+    broker.abort_handoff();
     broker.detach_serial_control();
+}
+
+enum IoLoopExit {
+    Stop,
+    Reconnect,
+    Handoff {
+        duration_ms: u64,
+        acknowledgement: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 fn io_loop(
@@ -186,18 +219,35 @@ fn io_loop(
     stop: &StopSignal,
     flow: &str,
     read_timeout_ms: u64,
-) -> bool {
+) -> IoLoopExit {
     const MAX_WRITE_BURST: usize = 32;
     const MAX_WRITE_BURST_BYTES: usize = 256 * 1024;
     let mut buf = [0u8; 4096];
     loop {
         if stop.is_requested() {
-            return false;
+            return IoLoopExit::Stop;
         }
 
         while let Ok(control) = control_rx.try_recv() {
-            if !apply_control(port, control, stop, flow) {
-                return false;
+            match control {
+                SerialControl::Command { .. } => {
+                    if !apply_control(port, control, stop, flow) {
+                        return IoLoopExit::Stop;
+                    }
+                }
+                SerialControl::BeginHandoff {
+                    duration_ms,
+                    acknowledgement,
+                } => {
+                    drop_pending_writes(broker, write_rx, "serial_handoff");
+                    return IoLoopExit::Handoff {
+                        duration_ms,
+                        acknowledgement,
+                    };
+                }
+                SerialControl::ResumeHandoff { acknowledgement } => {
+                    let _ = acknowledgement.send(Err("no serial handoff is active".into()));
+                }
             }
         }
 
@@ -208,7 +258,7 @@ fn io_loop(
                 Ok(write) => {
                     if stop.is_requested() {
                         broker.on_device_tx_not_written(write, "serial is stopping");
-                        return false;
+                        return IoLoopExit::Stop;
                     }
                     if let Err(reason) = broker.validate_device_write(&write) {
                         broker.on_device_tx_not_written(write, reason);
@@ -220,7 +270,7 @@ fn io_loop(
                     if let Err(e) = result {
                         tracing::warn!("serial write error: {e}");
                         broker.on_device_tx_failed(write, e.to_string());
-                        return true; // reconnect
+                        return IoLoopExit::Reconnect;
                     }
                     broker.on_device_tx_written(write);
                     burst_bytes = burst_bytes.saturating_add(bytes);
@@ -229,7 +279,7 @@ fn io_loop(
                     }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => return false,
+                Err(mpsc::error::TryRecvError::Disconnected) => return IoLoopExit::Stop,
             }
         }
 
@@ -237,7 +287,7 @@ fn io_loop(
             Ok(0) => {
                 // timeout or EOF depending on backend
                 if stop.wait_timeout(Duration::from_millis(read_timeout_ms.min(20))) {
-                    return false;
+                    return IoLoopExit::Stop;
                 }
             }
             Ok(n) => {
@@ -246,14 +296,58 @@ fn io_loop(
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if stop.wait_timeout(Duration::from_millis(5)) {
-                    return false;
+                    return IoLoopExit::Stop;
                 }
             }
             Err(e) => {
                 tracing::warn!("serial read error: {e}");
                 broker.on_serial_read_gap(format!("serial read error: {e}"));
-                return true; // reconnect
+                return IoLoopExit::Reconnect;
             }
+        }
+    }
+}
+
+fn wait_handoff(
+    broker: &Broker,
+    control_rx: &mut mpsc::Receiver<SerialControl>,
+    stop: &StopSignal,
+    duration_ms: u64,
+) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(duration_ms);
+    loop {
+        if stop.is_requested() {
+            return false;
+        }
+        while let Ok(control) = control_rx.try_recv() {
+            match control {
+                SerialControl::ResumeHandoff { acknowledgement } => {
+                    let _ = acknowledgement.send(Ok(()));
+                    broker.log().event("serial_handoff_resumed");
+                    return true;
+                }
+                SerialControl::Command {
+                    acknowledgement, ..
+                } => {
+                    let _ = acknowledgement.send(Err(
+                        "serial owner is released for handoff; resume before control".into(),
+                    ));
+                }
+                SerialControl::BeginHandoff {
+                    acknowledgement, ..
+                } => {
+                    let _ = acknowledgement.send(Err("serial handoff is already active".into()));
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            let _ = broker.expire_handoff();
+            broker.log().event("serial_handoff_expired");
+            return true;
+        }
+        if stop.wait_timeout(remaining.min(Duration::from_millis(20))) {
+            return false;
         }
     }
 }
@@ -349,7 +443,10 @@ fn apply_control(
     let SerialControl::Command {
         command,
         acknowledgement,
-    } = control;
+    } = control
+    else {
+        return true;
+    };
     let result = match command {
         ControlCommand::Dtr(level) => port
             .write_data_terminal_ready(level)
@@ -406,13 +503,20 @@ fn run_mock(
 
     // Optional inject path: mock:name listens on a side channel via global? Keep simple loopback.
     while !stop.is_requested() {
-        while let Ok(SerialControl::Command {
-            acknowledgement, ..
-        }) = control_rx.try_recv()
-        {
-            let _ = acknowledgement.send(Err(
-                "physical serial control lines are unavailable in mock mode".into(),
-            ));
+        while let Ok(control) = control_rx.try_recv() {
+            match control {
+                SerialControl::Command {
+                    acknowledgement, ..
+                }
+                | SerialControl::BeginHandoff {
+                    acknowledgement, ..
+                }
+                | SerialControl::ResumeHandoff { acknowledgement } => {
+                    let _ = acknowledgement.send(Err(
+                        "physical serial control and handoff are unavailable in mock mode".into(),
+                    ));
+                }
+            }
         }
         match write_rx.try_recv() {
             Ok(write) => {
@@ -468,10 +572,16 @@ fn drop_pending_writes(broker: &Broker, write_rx: &mut mpsc::Receiver<DeviceWrit
 }
 
 fn drop_pending_controls(control_rx: &mut mpsc::Receiver<SerialControl>, reason: &str) {
-    while let Ok(SerialControl::Command {
-        acknowledgement, ..
-    }) = control_rx.try_recv()
-    {
+    while let Ok(control) = control_rx.try_recv() {
+        let acknowledgement = match control {
+            SerialControl::Command {
+                acknowledgement, ..
+            }
+            | SerialControl::BeginHandoff {
+                acknowledgement, ..
+            }
+            | SerialControl::ResumeHandoff { acknowledgement } => acknowledgement,
+        };
         let _ = acknowledgement.send(Err(format!("serial control was not attempted: {reason}")));
     }
 }

@@ -21,6 +21,12 @@ All notable changes to this project are documented in this file.
 - Added a bounded owner-thread command channel and `POST /v1/control` for DTR, RTS, and BREAK.
 - Control operations require the explicit `api.can_control` capability plus an opaque write lease; RTS is guarded against hardware-flow-control conflicts and mock mode makes no physical claim.
 
+### Safe handoff
+
+- Added bounded `POST /v1/handoff` and `/v1/handoff/resume` for external maintenance tools.
+- The serial owner releases the OS handle before acknowledging, queued TX and new leases are blocked, the old lease is invalidated, and TTL expiry resumes automatically.
+- Handoff tokens are response-only credentials and are excluded from status, logs, and canonical evidence.
+
 ### Event ledger and safe replay
 
 - Added a canonical `ohmyserial.event` v1 envelope with session sequence, UTC/monotonic time, port connection epoch, typed RX/TX/connection/control/gap payloads, and standard padded Base64 byte encoding.

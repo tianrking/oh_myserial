@@ -102,11 +102,19 @@ pub enum SerialControl {
         command: ControlCommand,
         acknowledgement: oneshot::Sender<Result<(), String>>,
     },
+    BeginHandoff {
+        duration_ms: u64,
+        acknowledgement: oneshot::Sender<Result<(), String>>,
+    },
+    ResumeHandoff {
+        acknowledgement: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StatusSnapshot {
     pub port: PortStatusView,
+    pub handoff: Option<HandoffStatusView>,
     pub tx_mode: String,
     pub lock_owner: Option<String>,
     pub lock_expires_ms: Option<u64>,
@@ -114,6 +122,21 @@ pub struct StatusSnapshot {
     pub endpoints: Vec<EndpointView>,
     pub clients: Vec<ClientView>,
     pub stats: StatsView,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HandoffStatusView {
+    pub active: bool,
+    pub path: String,
+    pub expires_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HandoffView {
+    pub path: String,
+    pub expires_ms: u64,
+    /// Opaque bearer returned only by the handoff request and resume endpoint.
+    pub handoff_token: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -346,6 +369,7 @@ struct BrokerState {
     clients: HashMap<ClientId, ClientSlot>,
     policy: Policy,
     lock: Option<WriteLock>,
+    handoff: Option<HandoffState>,
     port: PortStatus,
     connection_epoch: u64,
     history: VecDeque<u8>,
@@ -360,6 +384,12 @@ struct BrokerState {
     slow_disconnects: AtomicU64,
     tx_denies: AtomicU64,
     persistence_gap_reported: bool,
+}
+
+struct HandoffState {
+    token: String,
+    path: String,
+    expires_at: Instant,
 }
 
 /// One atomic device-bound write and its completion metadata. Keeping these in
@@ -463,6 +493,7 @@ impl Broker {
             clients: HashMap::new(),
             policy,
             lock: None,
+            handoff: None,
             port,
             connection_epoch,
             history: VecDeque::with_capacity(history_cap.min(1024)),
@@ -515,6 +546,199 @@ impl Broker {
         *self.serial_control.lock() = None;
     }
 
+    fn handoff_is_active(g: &BrokerState) -> bool {
+        g.handoff.is_some()
+    }
+
+    fn clear_handoff_if(&self, token: &str) {
+        let mut g = self.state.lock();
+        if g.handoff
+            .as_ref()
+            .is_some_and(|handoff| handoff.token == token)
+        {
+            g.handoff = None;
+        }
+    }
+
+    /// Ask the owner to close the physical port for a bounded external-tool
+    /// handoff. The bearer is generated server-side and never enters the
+    /// canonical event ledger or status snapshot.
+    pub async fn begin_handoff(
+        &self,
+        actor: &str,
+        lease_token: Option<&str>,
+        duration_ms: u64,
+    ) -> Result<HandoffView, String> {
+        Self::validate_actor_label(actor)?;
+        if !(1..=600_000).contains(&duration_ms) {
+            return Err("handoff duration_ms must be between 1 and 600000".into());
+        }
+        let now = Instant::now();
+        let (sender, connection_epoch, timeout, path, token) = {
+            let mut g = self.state.lock();
+            if Self::handoff_is_active(&g) {
+                return Err("a serial handoff is already active".into());
+            }
+            if !g.port.connected {
+                return Err("serial port is disconnected; handoff was not queued".into());
+            }
+            let Some(token) = lease_token else {
+                return Err("handoff requires an active write lease token".into());
+            };
+            if !g
+                .lock
+                .as_ref()
+                .is_some_and(|lock| lock.authorizes(Some(token), now))
+            {
+                return Err("handoff lease expired, was released, or was replaced".into());
+            }
+            let Some(sender) = self.serial_control.lock().clone() else {
+                return Err("serial owner control channel is unavailable".into());
+            };
+            let handoff_token = Uuid::new_v4().as_simple().to_string();
+            let path = g.port.path.clone();
+            g.handoff = Some(HandoffState {
+                token: handoff_token.clone(),
+                path: path.clone(),
+                expires_at: now + Duration::from_millis(duration_ms),
+            });
+            (
+                sender,
+                g.connection_epoch,
+                Duration::from_millis(g.policy.write_timeout_ms.max(1)),
+                path,
+                handoff_token,
+            )
+        };
+
+        let (acknowledgement, result) = oneshot::channel();
+        let envelope = SerialControl::BeginHandoff {
+            duration_ms,
+            acknowledgement,
+        };
+        let result = match tokio::time::timeout(timeout, sender.send(envelope)).await {
+            Ok(Ok(())) => match tokio::time::timeout(timeout, result).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("serial owner dropped the handoff acknowledgement".into()),
+                Err(_) => Err("serial handoff acknowledgement timed out".into()),
+            },
+            Ok(Err(_)) => Err("serial owner control channel is closed".into()),
+            Err(_) => Err("serial handoff queue deadline expired".into()),
+        };
+        if let Err(error) = result {
+            self.clear_handoff_if(&token);
+            let _ = self.record_event(
+                connection_epoch,
+                EventPayload::Control(ControlPayload {
+                    actor: Some(actor.to_owned()),
+                    name: "handoff_rejected".into(),
+                    value: Some(error.clone()),
+                }),
+            );
+            return Err(error);
+        }
+
+        // A handoff invalidates the old write lease. The external tool must
+        // not be able to race queued writes through the hub while it owns the
+        // physical handle; a fresh lease can be acquired after resume.
+        let released_lease = {
+            let mut g = self.state.lock();
+            g.lock.take().map(|lock| lock.owner)
+        };
+        let _ = self.record_event(
+            connection_epoch,
+            EventPayload::Control(ControlPayload {
+                actor: Some(actor.to_owned()),
+                name: "handoff_started".into(),
+                value: Some(format!("duration_ms={duration_ms}")),
+            }),
+        );
+        if let Some(owner) = released_lease {
+            let _ = self.record_event(
+                connection_epoch,
+                EventPayload::Control(ControlPayload {
+                    actor: Some(owner),
+                    name: "lease_released_for_handoff".into(),
+                    value: None,
+                }),
+            );
+        }
+        Ok(HandoffView {
+            path,
+            expires_ms: duration_ms,
+            handoff_token: token,
+        })
+    }
+
+    /// Resume the owner after a handoff token is presented. Expired tokens
+    /// fail closed; the owner independently resumes at the same TTL boundary.
+    pub async fn resume_handoff(&self, handoff_token: &str) -> Result<(), String> {
+        if handoff_token.is_empty() || handoff_token.len() > 128 {
+            return Err("invalid handoff token".into());
+        }
+        let now = Instant::now();
+        let (sender, connection_epoch, timeout) = {
+            let mut g = self.state.lock();
+            let Some(handoff) = g.handoff.as_ref() else {
+                return Err("no active serial handoff".into());
+            };
+            if handoff.expires_at <= now {
+                g.handoff = None;
+                return Err("handoff token expired".into());
+            }
+            if handoff.token != handoff_token {
+                return Err("invalid handoff token".into());
+            }
+            let Some(sender) = self.serial_control.lock().clone() else {
+                return Err("serial owner control channel is unavailable".into());
+            };
+            (
+                sender,
+                g.connection_epoch,
+                Duration::from_millis(g.policy.write_timeout_ms.max(1)),
+            )
+        };
+        let (acknowledgement, result) = oneshot::channel();
+        let envelope = SerialControl::ResumeHandoff { acknowledgement };
+        let result = match tokio::time::timeout(timeout, sender.send(envelope)).await {
+            Ok(Ok(())) => match tokio::time::timeout(timeout, result).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("serial owner dropped the resume acknowledgement".into()),
+                Err(_) => Err("serial handoff resume timed out".into()),
+            },
+            Ok(Err(_)) => Err("serial owner control channel is closed".into()),
+            Err(_) => Err("serial handoff resume queue deadline expired".into()),
+        };
+        result?;
+        let _ = self.state.lock().handoff.take();
+        let _ = self.record_event(
+            connection_epoch,
+            EventPayload::Control(ControlPayload {
+                actor: None,
+                name: "handoff_resumed".into(),
+                value: None,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Called by the owner when a TTL expires without an explicit resume.
+    pub fn expire_handoff(&self) -> bool {
+        let mut g = self.state.lock();
+        let expired = g
+            .handoff
+            .as_ref()
+            .is_some_and(|handoff| handoff.expires_at <= Instant::now());
+        if expired {
+            g.handoff = None;
+        }
+        expired
+    }
+
+    pub fn abort_handoff(&self) {
+        self.state.lock().handoff = None;
+    }
+
     /// Execute one physical control-line operation under a live write lease.
     /// The lease is intentionally required even when TX mode is not exclusive:
     /// toggling DTR/RTS or asserting BREAK can reset or disrupt hardware.
@@ -529,6 +753,9 @@ impl Broker {
         let now = Instant::now();
         let (sender, connection_epoch, timeout) = {
             let g = self.state.lock();
+            if Self::handoff_is_active(&g) {
+                return Err("serial handoff is active; control is temporarily unavailable".into());
+            }
             if !g.port.connected {
                 return Err("serial port is disconnected; control was not queued".into());
             }
@@ -1000,6 +1227,9 @@ impl Broker {
     pub(crate) fn validate_device_write(&self, write: &DeviceWrite) -> Result<(), String> {
         let g = self.state.lock();
         let now = Instant::now();
+        if Self::handoff_is_active(&g) {
+            return Err("serial handoff is active; write was not attempted".into());
+        }
         if !g.port.connected || write.connection_epoch != g.connection_epoch {
             return Err("stale connection epoch".into());
         }
@@ -1117,6 +1347,10 @@ impl Broker {
                 g.lock = None;
             }
 
+            if Self::handoff_is_active(&g) {
+                g.tx_denies.fetch_add(1, Ordering::Relaxed);
+                return Err("serial handoff is active; write was not queued".into());
+            }
             if !g.port.connected {
                 g.tx_denies.fetch_add(1, Ordering::Relaxed);
                 return Err(format!(
@@ -1319,6 +1553,9 @@ impl Broker {
     pub fn acquire_lock(&self, client: &str) -> Result<WriteLockView, String> {
         Self::validate_actor_label(client)?;
         let mut g = self.state.lock();
+        if Self::handoff_is_active(&g) {
+            return Err("serial handoff is active; acquire a lease after resume".into());
+        }
         let now = Instant::now();
         if g.lock.as_ref().is_some_and(|l| !l.active(now)) {
             g.lock = None;
@@ -1445,6 +1682,14 @@ impl Broker {
             ),
             _ => (None, None),
         };
+        let handoff = g.handoff.as_ref().map(|handoff| HandoffStatusView {
+            active: true,
+            path: handoff.path.clone(),
+            expires_ms: handoff
+                .expires_at
+                .saturating_duration_since(now)
+                .as_millis() as u64,
+        });
         let mode = match g.policy.mode {
             TxMode::QueueByLine => "queue_by_line",
             TxMode::QueueByFrame => "queue_by_frame",
@@ -1459,6 +1704,7 @@ impl Broker {
                 epoch: g.connection_epoch,
                 detail: g.port.detail.clone(),
             },
+            handoff,
             tx_mode: mode.into(),
             lock_owner,
             lock_expires_ms,
@@ -1717,10 +1963,15 @@ mod tests {
                     .await
             })
         };
-        let SerialControl::Command {
-            command,
-            acknowledgement,
-        } = control_rx.recv().await.expect("owner command");
+        let (command, acknowledgement) = match control_rx.recv().await.expect("owner command") {
+            SerialControl::Command {
+                command,
+                acknowledgement,
+            } => (command, acknowledgement),
+            SerialControl::BeginHandoff { .. } | SerialControl::ResumeHandoff { .. } => {
+                panic!("unexpected handoff command")
+            }
+        };
         assert_eq!(command, ControlCommand::Dtr(true));
         acknowledgement.send(Ok(())).unwrap();
         operation.await.unwrap().unwrap();
@@ -1738,6 +1989,53 @@ mod tests {
                     if payload.actor.as_deref() == Some("agent") && payload.name == "dtr"
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn handoff_is_bounded_invalidates_lease_and_requires_resume_token() {
+        let (broker, _serial_rx) = test_broker(TxMode::QueueByLine);
+        let (control_tx, mut control_rx) = mpsc::channel(2);
+        broker.attach_serial_control(control_tx);
+        let lease = broker.acquire_lock("handoff-owner").unwrap();
+        let begin = {
+            let broker = broker.clone();
+            let token = lease.lease_token.clone();
+            tokio::spawn(async move {
+                broker
+                    .begin_handoff("handoff-owner", Some(&token), 5000)
+                    .await
+            })
+        };
+        let begin_ack = match control_rx.recv().await.expect("begin handoff command") {
+            SerialControl::BeginHandoff {
+                duration_ms,
+                acknowledgement,
+            } => {
+                assert_eq!(duration_ms, 5000);
+                acknowledgement
+            }
+            _ => panic!("unexpected command"),
+        };
+        begin_ack.send(Ok(())).unwrap();
+        let view = begin.await.unwrap().unwrap();
+        assert_eq!(view.path, "mock");
+        assert_eq!(view.expires_ms, 5000);
+        assert!(broker.snapshot().handoff.is_some());
+        assert!(broker.snapshot().lock_owner.is_none());
+        assert!(broker.acquire_lock("new-owner").is_err());
+
+        let resume = {
+            let broker = broker.clone();
+            let token = view.handoff_token.clone();
+            tokio::spawn(async move { broker.resume_handoff(&token).await })
+        };
+        let resume_ack = match control_rx.recv().await.expect("resume handoff command") {
+            SerialControl::ResumeHandoff { acknowledgement } => acknowledgement,
+            _ => panic!("unexpected command"),
+        };
+        resume_ack.send(Ok(())).unwrap();
+        resume.await.unwrap().unwrap();
+        assert!(broker.snapshot().handoff.is_none());
     }
 
     #[tokio::test]

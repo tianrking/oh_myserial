@@ -467,6 +467,8 @@ RUST_LOG=debug ohmyserial run -c ohmyserial.toml
 | `POST` | `/v1/workflows/run` | 有界线性 lease/send/expect 工作流 |
 | `POST` | `/v1/write` | 向设备发送 text 或 hex |
 | `POST` | `/v1/control` | DTR/RTS/BREAK；需要 `can_control` 与租约 token |
+| `POST` | `/v1/handoff` | 关闭真实串口，给外部维护工具一个有界窗口 |
+| `POST` | `/v1/handoff/resume` | 用一次性交接 token 恢复 owner |
 | `POST` | `/v1/lock` | 申请写锁 |
 | `DELETE` | `/v1/lock` | 释放写锁 |
 | `WS` | `/v1/stream` | 实时 RX |

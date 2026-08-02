@@ -138,6 +138,8 @@ pub async fn spawn_api_server_owned(
         .route("/v1/events/stream", get(events_stream))
         .route("/v1/workflows/run", post(workflow_run))
         .route("/v1/control", post(control))
+        .route("/v1/handoff", post(begin_handoff))
+        .route("/v1/handoff/resume", post(resume_handoff))
         .route("/v1/write", post(write))
         .route("/v1/lock", post(lock).delete(unlock))
         // Unlimited concurrent agents/monitors share the same stream path.
@@ -979,6 +981,85 @@ async fn control(State(st): State<Arc<ApiState>>, Json(body): Json<ControlBody>)
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(error) if error.contains("lease") => (
             StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HandoffBody {
+    #[serde(default = "default_handoff_duration_ms")]
+    duration_ms: u64,
+    #[serde(default)]
+    as_client: Option<String>,
+    lease_token: Option<String>,
+}
+
+fn default_handoff_duration_ms() -> u64 {
+    30_000
+}
+
+async fn begin_handoff(State(st): State<Arc<ApiState>>, Json(body): Json<HandoffBody>) -> Response {
+    if !st.can_control {
+        return permission_denied("serial handoff access");
+    }
+    let actor = body.as_client.as_deref().unwrap_or(&st.default_writer);
+    match st
+        .broker
+        .begin_handoff(actor, body.lease_token.as_deref(), body.duration_ms)
+        .await
+    {
+        Ok(view) => Json(serde_json::json!({ "ok": true, "handoff": view })).into_response(),
+        Err(error) if error.contains("lease") => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response(),
+        Err(error) if error.contains("duration") => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response(),
+        Err(error) if error.contains("already active") => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResumeHandoffBody {
+    handoff_token: String,
+}
+
+async fn resume_handoff(
+    State(st): State<Arc<ApiState>>,
+    Json(body): Json<ResumeHandoffBody>,
+) -> Response {
+    if !st.can_control {
+        return permission_denied("serial handoff access");
+    }
+    match st.broker.resume_handoff(&body.handoff_token).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(error) if error.contains("token") => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response(),
+        Err(error) if error.contains("no active") => (
+            StatusCode::CONFLICT,
             Json(serde_json::json!({ "ok": false, "error": error })),
         )
             .into_response(),
