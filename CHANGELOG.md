@@ -27,6 +27,11 @@ All notable changes to this project are documented in this file.
 - The serial owner releases the OS handle before acknowledging, queued TX and new leases are blocked, the old lease is invalidated, and TTL expiry resumes automatically.
 - Handoff tokens are response-only credentials and are excluded from status, logs, and canonical evidence.
 
+### Multi-profile supervision
+
+- Added `ohmyserial supervise -c profile-a.toml -c profile-b.toml` for independent real-port hubs in one process.
+- Added preflight collision checks for listeners, PTY links, real paths, USB selectors, and ledger directories, plus startup rollback and coordinated graceful shutdown.
+
 ### Event ledger and safe replay
 
 - Added a canonical `ohmyserial.event` v1 envelope with session sequence, UTC/monotonic time, port connection epoch, typed RX/TX/connection/control/gap payloads, and standard padded Base64 byte encoding.

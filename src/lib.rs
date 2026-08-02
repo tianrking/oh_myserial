@@ -9,4 +9,5 @@ pub mod observe;
 pub mod policy;
 pub mod replay;
 pub mod serial;
+pub mod supervisor;
 pub mod workflow;

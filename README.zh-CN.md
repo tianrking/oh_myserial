@@ -144,7 +144,7 @@
 | 事件账本 | 版本化 RX/TX/连接/控制/gap 证据；有界内存 + 可选哈希 NDJSON | ✅ |
 | 安全回放 | 校验后只读的 `immediate` / `original` / `manual` 回放 | ✅ |
 | Mock 口 | `mock:demo` 无硬件回环 | ✅ |
-| TOML + CLI | `run` / `init` / `list-ports` / `status` | ✅ |
+| TOML + CLI | `run` / `init` / `list-ports` / `status` / `supervise` | ✅ |
 | 单进程多真口 | 多 profile | 🔜 |
 | RFC2217 | 网络串口控制 | 🔜 |
 | Windows 原生虚拟 COM | 驱动级 | 🔜 / 外部桥接 |
@@ -410,6 +410,16 @@ format = "hex+text"
 填写非零 VID/PID，并在同型号设备超过一个时填写 `serial_number`。每次打开前
 都会重新枚举；零匹配或多匹配会保持断开并报告错误，不会猜测目标设备。selector
 不能和 `mock:` 路径同时使用。
+
+多串口可由同一进程独立监督：
+
+```bash
+ohmyserial supervise -c board-a.toml -c board-b.toml
+```
+
+启动前会检查 API/TCP/WS 监听、PTY 链接、真实设备路径、USB selector 和账本
+目录冲突；任一 profile 启动失败会回滚已经启动的 hub，Ctrl+C 会逐个优雅关闭。
+详细约定见 [`SUPERVISOR.md`](./SUPERVISOR.md)。
 
 | 字段 | 含义 |
 |------|------|

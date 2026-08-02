@@ -7,7 +7,7 @@ use tracing_subscriber::EnvFilter;
 
 use ohmyserial::config::{Config, QuickShare};
 use ohmyserial::replay::{ReplayMode, ReplayOptions, ReplaySession};
-use ohmyserial::{hub, serial};
+use ohmyserial::{hub, serial, supervisor};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -74,6 +74,12 @@ enum Commands {
         /// Open the embedded web console in the default browser
         #[arg(long, default_value_t = false)]
         ui: bool,
+    },
+    /// Run multiple independent TOML profiles in one process.
+    Supervise {
+        /// Profile paths; repeat `-c` for every real serial device.
+        #[arg(short = 'c', long = "config", required = true, num_args = 1..)]
+        configs: Vec<PathBuf>,
     },
     /// Write a friendly sample config (platform-aware defaults).
     Init {
@@ -187,6 +193,17 @@ async fn main() -> anyhow::Result<()> {
             let api_bind = cfg.api.bind.clone();
             tracing::info!("loaded config {}", config.display());
             run_until_ctrl_c(cfg, ui, Some(api_bind)).await
+        }
+        Commands::Supervise { configs } => {
+            let profiles = supervisor::load_profiles(&configs)?;
+            eprintln!("starting {} independent serial profile(s)", profiles.len());
+            let handle = supervisor::Supervisor::start(profiles).await?;
+            tracing::info!(profiles = handle.len(), "multi-profile supervisor ready");
+            tracing::info!("press Ctrl+C to stop all profiles");
+            tokio::signal::ctrl_c().await?;
+            tracing::info!("shutting down all profiles");
+            handle.shutdown_gracefully().await;
+            Ok(())
         }
         Commands::Init { output } => {
             let sample = sample_config();

@@ -148,8 +148,8 @@ Device (UART/COM)
 | Event ledger | Versioned RX/TX/connection/control/gap evidence; bounded memory + optional hashed NDJSON | ✅ |
 | Safe replay | Verified, read-only `immediate` / `original` / `manual` replay | ✅ |
 | Mock port | `mock:demo` loopback without hardware | ✅ |
-| TOML config + CLI | `run` / `init` / `list-ports` / `status` | ✅ |
-| Multi-port single process | Multiple real profiles in one process | 🔜 |
+| TOML config + CLI | `run` / `init` / `list-ports` / `status` / `supervise` | ✅ |
+| Multi-port single process | Multiple independent real profiles with collision checks | ✅ |
 | RFC2217 | Telnet serial control over network | 🔜 |
 | Native Windows virtual COM | Kernel/driver-level COM clone | 🔜 / external bridge |
 
@@ -325,6 +325,7 @@ HTTP    http://127.0.0.1:8787
 ```bash
 ./target/release/ohmyserial init -o ohmyserial.toml
 ./target/release/ohmyserial run -c ohmyserial.toml
+./target/release/ohmyserial supervise -c board-a.toml -c board-b.toml
 # overrides without editing file:
 ./target/release/ohmyserial run -c ohmyserial.toml -d /dev/ttyUSB0 --pty 3
 ```
@@ -758,7 +759,7 @@ CI: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) — Ubuntu, macOS, 
 | ✅ Evidence | Canonical event ledger, optional hashed segments, query/export/event WS, safe replay |
 | ✅ Automation | Bounded linear workflows with evidence cursors and idempotent request IDs |
 | ✅ Delivered | Device identity, control lines, bounded handoff |
-| 🔜 Next | Multi-port supervision |
+| ✅ Delivered | Multi-port supervision |
 | 🧭 Later | RFC2217, Windows COM bridge guide, richer web evidence tooling, metrics |
 
 Not core goals: cloud SaaS, heavy GUI installer, kernel virtual-COM driver (unless demand is clear).
