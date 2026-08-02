@@ -368,6 +368,8 @@ fn sample_config() -> String {
 
 [real]
 path = "mock:demo"
+# For exact USB identity instead, leave path as a display fallback and add:
+# usb = {{ vid = 0x10c4, pid = 0xea60, serial_number = "board-01" }}
 baud = 115200
 databits = 8
 parity = "none"

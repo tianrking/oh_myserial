@@ -78,6 +78,11 @@ pub struct RealPortConfig {
     /// Serial device path, e.g. `/dev/tty.usbmodem*` or `COM3`.
     /// Use `mock:` prefix for in-process loopback (testing without hardware).
     pub path: String,
+    /// Optional exact USB identity selector. When present, `path` is only a
+    /// display fallback; the serial owner resolves one matching VID/PID (and
+    /// optional serial number) immediately before each open attempt.
+    #[serde(default)]
+    pub usb: Option<UsbSelector>,
     #[serde(default = "default_baud")]
     pub baud: u32,
     #[serde(default = "default_databits")]
@@ -95,6 +100,14 @@ pub struct RealPortConfig {
     /// Read timeout in milliseconds for the serial reader thread.
     #[serde(default = "default_read_timeout_ms")]
     pub read_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsbSelector {
+    pub vid: u16,
+    pub pid: u16,
+    #[serde(default)]
+    pub serial_number: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +302,7 @@ impl Default for Config {
         Self {
             real: RealPortConfig {
                 path: "mock:demo".into(),
+                usb: None,
                 baud: default_baud(),
                 databits: default_databits(),
                 parity: default_parity(),
@@ -399,6 +413,7 @@ impl Config {
         let mut cfg = Config {
             real: RealPortConfig {
                 path: q.device,
+                usb: None,
                 baud: q.baud,
                 databits: 8,
                 parity: "none".into(),
@@ -658,8 +673,21 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.real.path.trim().is_empty() {
-            anyhow::bail!("real.path must not be empty");
+        if self.real.path.trim().is_empty() && self.real.usb.is_none() {
+            anyhow::bail!("real.path must be set unless real.usb selector is configured");
+        }
+        if let Some(selector) = &self.real.usb {
+            if self.real.path.starts_with("mock:") {
+                anyhow::bail!("real.usb selector cannot be combined with mock path");
+            }
+            if selector.vid == 0 || selector.pid == 0 {
+                anyhow::bail!("real.usb.vid and real.usb.pid must be nonzero");
+            }
+            if selector.serial_number.as_ref().is_some_and(|serial| {
+                serial.is_empty() || serial.len() > 256 || serial.chars().any(char::is_control)
+            }) {
+                anyhow::bail!("real.usb.serial_number must be 1..=256 non-control characters");
+            }
         }
         let token_env = self.api.token_env.as_deref().map(str::trim);
         if self.api.token_env.is_some() && token_env.is_some_and(str::is_empty) {
@@ -952,6 +980,24 @@ mod tests {
     #[test]
     fn default_config_validates() {
         Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn usb_selector_requires_exact_nonzero_identity() {
+        let mut cfg = Config::default();
+        cfg.real.path.clear();
+        cfg.real.usb = Some(UsbSelector {
+            vid: 0x10c4,
+            pid: 0xea60,
+            serial_number: Some("board-01".into()),
+        });
+        cfg.validate().unwrap();
+
+        cfg.real.usb.as_mut().unwrap().vid = 0;
+        assert!(cfg.validate().unwrap_err().to_string().contains("nonzero"));
+        cfg.real.usb.as_mut().unwrap().vid = 0x10c4;
+        cfg.real.path = "mock:test".into();
+        assert!(cfg.validate().unwrap_err().to_string().contains("mock"));
     }
 
     #[test]

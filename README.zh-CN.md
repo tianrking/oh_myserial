@@ -351,6 +351,8 @@ curl -s -X DELETE http://127.0.0.1:8787/v1/lock \
 ```toml
 [real]
 path = "mock:demo"
+# 可选：按 USB 身份选择，避免 COM/tty 重编号后连错设备
+# usb = { vid = 0x10c4, pid = 0xea60, serial_number = "board-01" }
 baud = 115200
 reconnect = true
 
@@ -401,6 +403,11 @@ fsync_each_event = false
 mirror_console = true
 format = "hex+text"
 ```
+
+`real.usb` 可选用于按 USB 身份选择设备，避免 COM/tty 路径在重连后变化：
+填写非零 VID/PID，并在同型号设备超过一个时填写 `serial_number`。每次打开前
+都会重新枚举；零匹配或多匹配会保持断开并报告错误，不会猜测目标设备。selector
+不能和 `mock:` 路径同时使用。
 
 | 字段 | 含义 |
 |------|------|

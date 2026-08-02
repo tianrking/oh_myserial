@@ -7,6 +7,8 @@
 
 [real]
 path = "mock:demo"
+# For exact USB identity, keep a display fallback path and uncomment:
+# usb = { vid = 0x10c4, pid = 0xea60, serial_number = "board-01" }
 # path = "/dev/cu.usbmodem14101"   # macOS
 # path = "/dev/ttyUSB0"            # Linux
 # path = "COM3"                    # Windows

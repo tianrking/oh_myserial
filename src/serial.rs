@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::{Condvar, Mutex};
-use serialport::{DataBits, FlowControl, Parity, StopBits};
+use serialport::{DataBits, FlowControl, Parity, SerialPortType, StopBits};
 use tokio::sync::mpsc;
 
 use crate::broker::{Broker, DeviceWrite, PortStatus};
@@ -110,16 +110,16 @@ fn serial_thread(
         drop_pending_writes(&broker, &mut write_rx, "serial_disconnected");
 
         match open_port(&cfg) {
-            Ok(mut port) => {
+            Ok((mut port, resolved_path)) => {
                 broker.set_port_status(PortStatus {
-                    path: cfg.path.clone(),
+                    path: resolved_path.clone(),
                     baud: cfg.baud,
                     connected: true,
                     detail: "open".into(),
                 });
                 broker
                     .log()
-                    .event(&format!("serial_open path={}", cfg.path));
+                    .event(&format!("serial_open path={resolved_path}"));
                 backoff = Duration::from_millis(cfg.reconnect_ms.max(50));
 
                 if !io_loop(
@@ -242,7 +242,7 @@ fn io_loop(
     }
 }
 
-fn open_port(cfg: &RealPortConfig) -> anyhow::Result<Box<dyn serialport::SerialPort>> {
+fn open_port(cfg: &RealPortConfig) -> anyhow::Result<(Box<dyn serialport::SerialPort>, String)> {
     let parity = match cfg.parity.to_lowercase().as_str() {
         "odd" => Parity::Odd,
         "even" => Parity::Even,
@@ -264,7 +264,8 @@ fn open_port(cfg: &RealPortConfig) -> anyhow::Result<Box<dyn serialport::SerialP
         _ => FlowControl::None,
     };
 
-    let port = serialport::new(&cfg.path, cfg.baud)
+    let resolved_path = resolve_device_path(cfg)?;
+    let port = serialport::new(&resolved_path, cfg.baud)
         .data_bits(data)
         .parity(parity)
         .stop_bits(stop)
@@ -275,7 +276,48 @@ fn open_port(cfg: &RealPortConfig) -> anyhow::Result<Box<dyn serialport::SerialP
         // soon as bytes arrive.
         .timeout(read_poll_timeout(cfg.read_timeout_ms))
         .open()?;
-    Ok(port)
+    Ok((port, resolved_path))
+}
+
+fn resolve_device_path(cfg: &RealPortConfig) -> anyhow::Result<String> {
+    let Some(selector) = &cfg.usb else {
+        return Ok(cfg.path.clone());
+    };
+    let ports = serialport::available_ports()?;
+    let matches = ports
+        .into_iter()
+        .filter_map(|port| match port.port_type {
+            SerialPortType::UsbPort(info)
+                if info.vid == selector.vid
+                    && info.pid == selector.pid
+                    && selector
+                        .serial_number
+                        .as_ref()
+                        .is_none_or(|serial| info.serial_number.as_deref() == Some(serial)) =>
+            {
+                Some(port.port_name)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => anyhow::bail!(
+            "USB selector {:04x}:{:04x}{} matched no serial port",
+            selector.vid,
+            selector.pid,
+            selector
+                .serial_number
+                .as_deref()
+                .map_or(String::new(), |serial| format!(" serial={serial}"))
+        ),
+        [path] => Ok(path.clone()),
+        paths => anyhow::bail!(
+            "USB selector {:04x}:{:04x} is ambiguous; matches: {} (set serial_number)",
+            selector.vid,
+            selector.pid,
+            paths.join(", ")
+        ),
+    }
 }
 
 fn read_poll_timeout(configured_ms: u64) -> Duration {
@@ -487,6 +529,7 @@ mod tests {
         let broker = split.broker;
         let cfg = RealPortConfig {
             path: "mock:serial-drop".into(),
+            usb: None,
             baud: 115_200,
             databits: 8,
             parity: "none".into(),
@@ -519,6 +562,7 @@ mod tests {
             } else {
                 "/dev/ohmyserial-port-that-does-not-exist".into()
             },
+            usb: None,
             baud: 115_200,
             databits: 8,
             parity: "none".into(),

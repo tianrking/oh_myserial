@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Device identity
+
+- Added an exact USB VID/PID selector with optional serial-number disambiguation.
+- Re-resolve the physical port immediately before every open/reconnect, reject zero or ambiguous matches, and expose the resolved OS path in connection status.
+- Added configuration validation and English/Chinese setup documentation; mock tests make no hardware-in-loop claim.
+
 ### Bounded workflows
 
 - Added a finite linear workflow DSL with lease, atomic send, incremental RX expect, explicit assertions, waits, and reserved control steps.

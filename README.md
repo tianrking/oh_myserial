@@ -422,6 +422,8 @@ ohmyserial init -o ohmyserial.toml
 ```toml
 [real]
 path = "mock:demo"          # or /dev/ttyUSB0, COM3, …
+# Optional exact USB identity (re-resolved before every open/reconnect):
+# usb = { vid = 0x10c4, pid = 0xea60, serial_number = "board-01" }
 baud = 115200
 reconnect = true
 
@@ -474,6 +476,7 @@ format = "hex+text"
 | Field | Meaning |
 |-------|---------|
 | `real.path` | Device path or `mock:name` |
+| `real.usb` | Exact USB VID/PID selector with optional serial-number disambiguation; zero or ambiguous matches stay disconnected |
 | `tx.mode` | Concurrent write policy |
 | `tx.write_timeout_ms` | End-to-end queue + confirmed host-write deadline |
 | `tx.max_frame_bytes` / `max_write_bytes` | Bounds buffered stream frames and atomic writes |
@@ -759,6 +762,11 @@ No. It is an interactive **share hub** with TX control, not passive capture only
 
 **Does mock mode need hardware?**  
 No. `mock:demo` loops TX back as RX. It exercises hub, policy, lease, API, and shutdown logic, but it does **not** validate an OS serial driver, USB/UART timing, physical control lines, or a real device's command acknowledgement.
+
+**Can I reconnect to the same USB board after COM/tty renumbering?**  
+Yes. Set `real.usb.vid` and `real.usb.pid`, and add `serial_number` when more
+than one adapter has the same VID/PID. The selector is fail-closed: no match
+or multiple matches keeps the owner disconnected instead of guessing.
 
 ---
 
