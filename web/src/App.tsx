@@ -3,13 +3,16 @@ import { hubApi } from "./api/client";
 import type {
   ConnectionConfig,
   Endpoint,
+  LedgerEvent,
+  LedgerStatus,
   StatusSnapshot,
 } from "./api/types";
 import { httpBase, wsUrl } from "./api/types";
 import { bytesToHex, bytesToText, connectStream } from "./api/wsStream";
+import EventLedgerPanel from "./EventLedgerPanel";
 import "./App.css";
 
-type Tab = "monitor" | "endpoints" | "protocol";
+type Tab = "monitor" | "events" | "endpoints" | "protocol";
 
 type LogLine = {
   id: number;
@@ -21,6 +24,7 @@ type LogLine = {
 
 const STORAGE_KEY = "ohmyserial.web.conn";
 const CLIENT_NAME = "web-ui";
+const RECENT_EVENT_LIMIT = 200;
 
 function defaultConn(): ConnectionConfig {
   // 同源：由 hub 提供 http://127.0.0.1:8787/ 時自動連同一主機埠
@@ -71,6 +75,11 @@ export default function App() {
   const [status, setStatus] = useState<StatusSnapshot | null>(null);
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [ledgerStatus, setLedgerStatus] = useState<LedgerStatus | null>(null);
+  const [ledgerEvents, setLedgerEvents] = useState<LedgerEvent[]>([]);
+  const [ledgerLoading, setLedgerLoading] = useState(false);
+  const [ledgerError, setLedgerError] = useState<string | null>(null);
+  const ledgerAbortRef = useRef<AbortController | null>(null);
 
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [paused, setPaused] = useState(false);
@@ -117,12 +126,64 @@ export default function App() {
     setError(null);
   }, []);
 
+  const refreshLedger = useCallback(async (cfg: ConnectionConfig, bearerToken?: string) => {
+    ledgerAbortRef.current?.abort();
+    const controller = new AbortController();
+    ledgerAbortRef.current = controller;
+    setLedgerLoading(true);
+    setLedgerError(null);
+    try {
+      // The status high-water mark is required before asking for a stable
+      // recent window, so this dependency is intentionally sequential.
+      const nextStatus = await hubApi.eventsStatus(cfg, bearerToken, controller.signal);
+      if (!Number.isSafeInteger(nextStatus.newest_seq) || nextStatus.newest_seq < 0) {
+        throw new Error("事件序號超出瀏覽器可安全表示的範圍");
+      }
+      const oldestCursor = Math.max(0, (nextStatus.oldest_available_seq ?? 1) - 1);
+      const recentCursor = Math.max(0, nextStatus.newest_seq - RECENT_EVENT_LIMIT);
+      const response = await hubApi.events(
+        cfg,
+        {
+          afterSeq: Math.max(oldestCursor, recentCursor),
+          throughSeq: nextStatus.newest_seq,
+          limit: RECENT_EVENT_LIMIT,
+        },
+        bearerToken,
+        controller.signal,
+      );
+      if (response.session_id !== nextStatus.session_id) {
+        throw new Error("事件帳本 session 已切換，請重新整理");
+      }
+      setLedgerStatus(nextStatus);
+      setLedgerEvents(response.page.events);
+    } catch (ledgerFailure) {
+      if (!(ledgerFailure instanceof DOMException && ledgerFailure.name === "AbortError")) {
+        setLedgerError(
+          `事件帳本讀取失敗：${
+            ledgerFailure instanceof Error ? ledgerFailure.message : String(ledgerFailure)
+          }`,
+        );
+      }
+    } finally {
+      if (ledgerAbortRef.current === controller) {
+        ledgerAbortRef.current = null;
+        setLedgerLoading(false);
+      }
+    }
+  }, []);
+
   const disconnect = useCallback(() => {
     wsRef.current?.close();
     wsRef.current = null;
+    ledgerAbortRef.current?.abort();
+    ledgerAbortRef.current = null;
     setWsOpen(false);
     setOnline(false);
     setLeaseToken(null);
+    setLedgerStatus(null);
+    setLedgerEvents([]);
+    setLedgerError(null);
+    setLedgerLoading(false);
   }, []);
 
   const connect = useCallback(async () => {
@@ -136,7 +197,10 @@ export default function App() {
     setBusy(true);
     try {
       await hubApi.health(cfg);
-      await refreshMeta(cfg, apiBearerToken);
+      await Promise.all([
+        refreshMeta(cfg, apiBearerToken),
+        refreshLedger(cfg, apiBearerToken),
+      ]);
 
       wsRef.current?.close();
       const ws = connectStream(
@@ -173,6 +237,7 @@ export default function App() {
       );
       wsRef.current = ws;
     } catch (e) {
+      ledgerAbortRef.current?.abort();
       setOnline(false);
       setError(e instanceof Error ? e.message : String(e));
       pushLog({
@@ -182,7 +247,7 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [apiBearerToken, hostInput, portInput, pushLog, refreshMeta]);
+  }, [apiBearerToken, hostInput, portInput, pushLog, refreshLedger, refreshMeta]);
 
   // 定時刷新狀態
   useEffect(() => {
@@ -198,7 +263,13 @@ export default function App() {
     logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
   }, [logs, autoScroll]);
 
-  useEffect(() => () => wsRef.current?.close(), []);
+  useEffect(
+    () => () => {
+      wsRef.current?.close();
+      ledgerAbortRef.current?.abort();
+    },
+    [],
+  );
 
   const onSendText = async () => {
     if (!sendText) return;
@@ -374,6 +445,7 @@ export default function App() {
         {(
           [
             ["monitor", "監控與收發"],
+            ["events", "事件帳本"],
             ["endpoints", "並聯端點"],
             ["protocol", "協定說明"],
           ] as const
@@ -443,7 +515,7 @@ export default function App() {
                 type="button"
                 className="ghost"
                 disabled={!online || busy}
-                onClick={() => void refreshMeta(conn)}
+                onClick={() => void refreshMeta(conn, apiBearerToken)}
               >
                 重新整理
               </button>
@@ -526,6 +598,17 @@ export default function App() {
             </div>
           </section>
         </div>
+      )}
+
+      {tab === "events" && (
+        <EventLedgerPanel
+          status={ledgerStatus}
+          events={ledgerEvents}
+          loading={ledgerLoading}
+          error={ledgerError}
+          online={online}
+          onRefresh={() => void refreshLedger(conn, apiBearerToken)}
+        />
       )}
 
       {tab === "endpoints" && (

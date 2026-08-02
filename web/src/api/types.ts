@@ -68,6 +68,108 @@ export interface HealthResponse {
   service: string;
 }
 
+export type LedgerPersistenceState = "disabled" | "active" | "degraded" | "sealed";
+
+export type LedgerEventType = "rx" | "tx" | "connection" | "control" | "gap";
+
+export interface LedgerBytesPayload {
+  data_base64: string;
+  len: number;
+}
+
+interface LedgerEventBase {
+  schema: "ohmyserial.event";
+  version: 1;
+  session_id: string;
+  seq: number;
+  ts_utc: string;
+  mono_us: number;
+  port_id: string;
+  connection_epoch: number;
+}
+
+export type LedgerEvent =
+  | (LedgerEventBase & {
+      type: "rx";
+      payload: LedgerBytesPayload;
+    })
+  | (LedgerEventBase & {
+      type: "tx";
+      payload: LedgerBytesPayload & {
+        actor: string;
+        client_id?: string;
+      };
+    })
+  | (LedgerEventBase & {
+      type: "connection";
+      payload: {
+        state: "connected" | "disconnected" | "reconnecting" | "open_failed";
+        path: string;
+        baud: number;
+        detail?: string;
+      };
+    })
+  | (LedgerEventBase & {
+      type: "control";
+      payload: {
+        actor?: string;
+        name: string;
+        value?: string;
+      };
+    })
+  | (LedgerEventBase & {
+      type: "gap";
+      payload: {
+        scope: "rx_observation" | "tx_outcome" | "client_delivery" | "persistence";
+        certainty: "unknown" | "partial_or_unknown" | "not_delivered";
+        reason: string;
+        bytes?: LedgerBytesPayload;
+        actor?: string;
+        client_ids?: string[];
+      };
+    });
+
+export interface LedgerStatus {
+  session_id: string;
+  newest_seq: number;
+  oldest_available_seq: number | null;
+  retained_events: number;
+  retained_bytes: number;
+  evicted_events: number;
+  persistence: LedgerPersistenceState;
+  persistence_directory?: string;
+  persistence_error?: string;
+  sealed: boolean;
+  recovery?: unknown;
+  stale_recovery?: unknown;
+}
+
+export interface LedgerEventPage {
+  events: LedgerEvent[];
+  incomplete: boolean;
+  missing_through_seq?: number;
+  oldest_available_seq?: number;
+  newest_seq: number;
+  next_after_seq: number;
+  has_more: boolean;
+}
+
+export interface LedgerEventsResponse {
+  ok: true;
+  session_id: string;
+  page: LedgerEventPage;
+}
+
+export interface LedgerEventsQuery {
+  afterSeq?: number;
+  throughSeq?: number;
+  limit?: number;
+  types?: LedgerEventType[];
+  connectionEpoch?: number;
+  actor?: string;
+  containsHex?: string;
+}
+
 export interface ConnectionConfig {
   host: string;
   port: number;

@@ -10,6 +10,10 @@ use parking_lot::{Condvar, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use uuid::Uuid;
 
+use crate::ledger::{
+    BytesPayload, ConnectionPayload, ConnectionState, ControlPayload, EventEnvelope, EventPayload,
+    GapCertainty, GapPayload, GapScope, Ledger, LedgerError, MemoryOptions,
+};
 use crate::observe::{Direction, SessionLog};
 use crate::policy::{
     admit_write, AdmitContext, AdmitDecision, FrameAssembler, Policy, SlowClientPolicy, TxMode,
@@ -311,6 +315,7 @@ struct BrokerState {
     rx_block_events: AtomicU64,
     slow_disconnects: AtomicU64,
     tx_denies: AtomicU64,
+    persistence_gap_reported: bool,
 }
 
 /// One atomic device-bound write and its completion metadata. Keeping these in
@@ -344,6 +349,7 @@ pub struct Broker {
     serial_tx: mpsc::Sender<DeviceWrite>,
     /// Fan-out of raw RX for websocket late-join style subscribers (optional).
     rx_broadcast: broadcast::Sender<Bytes>,
+    ledger: Ledger,
     log: SessionLog,
     /// Notify waiters when serial connection state changes.
     port_watch: watch::Sender<PortStatus>,
@@ -389,6 +395,19 @@ impl Broker {
         history_cap: usize,
         serial_queue: usize,
     ) -> BrokerSplit {
+        let ledger = Ledger::memory(MemoryOptions::default())
+            .expect("the built-in ledger memory limits are valid");
+        Self::new_with_ledger(policy, port, log, history_cap, serial_queue, ledger)
+    }
+
+    pub fn new_with_ledger(
+        policy: Policy,
+        port: PortStatus,
+        log: SessionLog,
+        history_cap: usize,
+        serial_queue: usize,
+        ledger: Ledger,
+    ) -> BrokerSplit {
         let (serial_tx, serial_tx_rx) = mpsc::channel(serial_queue.max(16));
         let (rx_broadcast, _) = broadcast::channel(256);
         let (port_watch, port_watch_rx) = watch::channel(port.clone());
@@ -411,6 +430,7 @@ impl Broker {
             rx_block_events: AtomicU64::new(0),
             slow_disconnects: AtomicU64::new(0),
             tx_denies: AtomicU64::new(0),
+            persistence_gap_reported: false,
         };
 
         BrokerSplit {
@@ -418,6 +438,7 @@ impl Broker {
                 state: Arc::new(Mutex::new(state)),
                 serial_tx,
                 rx_broadcast,
+                ledger,
                 log,
                 port_watch,
             },
@@ -430,18 +451,96 @@ impl Broker {
         &self.log
     }
 
+    pub fn ledger(&self) -> Ledger {
+        self.ledger.clone()
+    }
+
+    pub fn record_control(
+        &self,
+        actor: Option<String>,
+        name: impl Into<String>,
+        value: Option<String>,
+    ) -> Result<EventEnvelope, LedgerError> {
+        let connection_epoch = self.state.lock().connection_epoch;
+        self.record_event(
+            connection_epoch,
+            EventPayload::Control(ControlPayload {
+                actor,
+                name: name.into(),
+                value,
+            }),
+        )
+    }
+
+    fn record_event(
+        &self,
+        connection_epoch: u64,
+        payload: EventPayload,
+    ) -> Result<EventEnvelope, LedgerError> {
+        let result = self.ledger.append(connection_epoch, payload);
+        if let Err(error @ LedgerError::PersistenceDegraded { .. }) = &result {
+            let first = {
+                let mut state = self.state.lock();
+                if state.persistence_gap_reported {
+                    false
+                } else {
+                    state.persistence_gap_reported = true;
+                    true
+                }
+            };
+            if first {
+                self.log
+                    .event(&format!("ledger_persistence_degraded error={error}"));
+                // This canonical warning is intentionally ring/live-only: the
+                // store is already degraded, but observers still need a stable
+                // sequence marking where durable evidence ceased.
+                let _ = self.ledger.append(
+                    connection_epoch,
+                    EventPayload::Gap(GapPayload {
+                        scope: GapScope::Persistence,
+                        certainty: GapCertainty::NotDelivered,
+                        reason: error.to_string(),
+                        bytes: None,
+                        actor: None,
+                        client_ids: Vec::new(),
+                    }),
+                );
+            }
+        }
+        result
+    }
+
     pub fn subscribe_rx(&self) -> broadcast::Receiver<Bytes> {
         self.rx_broadcast.subscribe()
     }
 
     pub fn set_port_status(&self, status: PortStatus) {
-        {
+        let connection_epoch = {
             let mut g = self.state.lock();
             if status.connected && !g.port.connected {
                 g.connection_epoch = g.connection_epoch.saturating_add(1);
             }
             g.port = status.clone();
-        }
+            g.connection_epoch
+        };
+        let connection_state = if status.connected {
+            ConnectionState::Connected
+        } else if status.detail.starts_with("open error:") {
+            ConnectionState::OpenFailed
+        } else if status.detail == "starting" || status.detail == "reconnecting" {
+            ConnectionState::Reconnecting
+        } else {
+            ConnectionState::Disconnected
+        };
+        let _ = self.record_event(
+            connection_epoch,
+            EventPayload::Connection(ConnectionPayload {
+                state: connection_state,
+                path: status.path.clone(),
+                baud: status.baud,
+                detail: Some(status.detail.clone()),
+            }),
+        );
         let _ = self.port_watch.send(status);
     }
 
@@ -494,7 +593,7 @@ impl Broker {
             connected_at: chrono::Local::now(),
         };
 
-        {
+        let connection_epoch = {
             let mut g = self.state.lock();
             g.clients.insert(
                 id,
@@ -504,22 +603,42 @@ impl Broker {
                     assembler: FrameAssembler::default(),
                 },
             );
-        }
+            g.connection_epoch
+        };
 
         self.log
             .event(&format!("client_join id={id} name={name} kind={kind}"));
+        let _ = self.record_event(
+            connection_epoch,
+            EventPayload::Control(ControlPayload {
+                actor: Some(name.clone()),
+                name: "client_joined".into(),
+                value: Some(format!("id={id} kind={kind}")),
+            }),
+        );
         (id, rx)
     }
 
     pub fn unregister_client(&self, id: ClientId) {
-        let mut g = self.state.lock();
-        if let Some(slot) = g.clients.remove(&id) {
+        let removed = {
+            let mut g = self.state.lock();
+            g.clients.remove(&id).map(|slot| (slot, g.connection_epoch))
+        };
+        if let Some((slot, connection_epoch)) = removed {
             // A lease is a bearer credential with its own expiry. It is not
             // tied to a display name, so an unrelated same-name disconnect
             // must never revoke it.
             slot.fanout.close();
             self.log
                 .event(&format!("client_leave id={id} name={}", slot.info.name));
+            let _ = self.record_event(
+                connection_epoch,
+                EventPayload::Control(ControlPayload {
+                    actor: Some(slot.info.name),
+                    name: "client_left".into(),
+                    value: Some(format!("id={id} kind={}", slot.info.kind)),
+                }),
+            );
         }
     }
 
@@ -537,6 +656,8 @@ impl Broker {
         if data.is_empty() {
             return;
         }
+        let connection_epoch = self.state.lock().connection_epoch;
+        let _ = self.record_event(connection_epoch, EventPayload::rx(&data));
         self.log.log(Direction::Rx, None, &data);
         {
             let g = self.state.lock();
@@ -576,18 +697,28 @@ impl Broker {
         let mut drop_newest = 0u64;
         let mut block_events = 0u64;
         let mut disconnects = 0u64;
+        let mut delivery_gaps = Vec::new();
         let block_deadline = Instant::now() + slow_block_timeout;
         for (id, fanout) in recipients {
             let remaining_block_budget = block_deadline.saturating_duration_since(Instant::now());
             match fanout.enqueue(data.clone(), slow, remaining_block_budget) {
                 FanoutResult::Queued => {}
-                FanoutResult::DroppedOldest => drop_oldest += 1,
-                FanoutResult::DroppedNewest => drop_newest += 1,
+                FanoutResult::DroppedOldest => {
+                    drop_oldest += 1;
+                    delivery_gaps.push(id.to_string());
+                }
+                FanoutResult::DroppedNewest => {
+                    drop_newest += 1;
+                    delivery_gaps.push(id.to_string());
+                }
                 FanoutResult::BlockedThenQueued => block_events += 1,
                 FanoutResult::Disconnected { dropped, blocked } => {
                     drop_newest += dropped;
                     block_events += u64::from(blocked);
                     disconnects += 1;
+                    if dropped > 0 {
+                        delivery_gaps.push(id.to_string());
+                    }
                     dead.push(id);
                 }
                 FanoutResult::Closed => dead.push(id),
@@ -606,19 +737,69 @@ impl Broker {
         for id in dead {
             self.unregister_client(id);
         }
+        if !delivery_gaps.is_empty() {
+            let _ = self.record_event(
+                connection_epoch,
+                EventPayload::Gap(GapPayload {
+                    scope: GapScope::ClientDelivery,
+                    certainty: GapCertainty::NotDelivered,
+                    reason: format!(
+                        "slow-client policy dropped delivery (oldest={drop_oldest}, newest={drop_newest})"
+                    ),
+                    bytes: Some(BytesPayload::from_bytes(&data)),
+                    actor: None,
+                    client_ids: delivery_gaps,
+                }),
+            );
+        }
+    }
+
+    /// Record that the serial driver could not prove continuous RX
+    /// observation. No byte range is invented because the process cannot know
+    /// what the device or driver may have dropped.
+    pub(crate) fn on_serial_read_gap(&self, reason: impl Into<String>) {
+        let connection_epoch = self.state.lock().connection_epoch;
+        let _ = self.record_event(
+            connection_epoch,
+            EventPayload::Gap(GapPayload {
+                scope: GapScope::RxObservation,
+                certainty: GapCertainty::Unknown,
+                reason: reason.into(),
+                bytes: None,
+                actor: None,
+                client_ids: Vec::new(),
+            }),
+        );
     }
 
     /// Complete an admitted write after the serial owner actually wrote and
     /// flushed its bytes. TX logs and counters intentionally live here rather
     /// than at queue admission time.
     pub(crate) fn on_device_tx_written(&self, write: DeviceWrite) {
+        let evidence = self.record_event(
+            write.connection_epoch,
+            EventPayload::tx_from(
+                write.actor.clone(),
+                Some(write.client_id.to_string()),
+                &write.data,
+            ),
+        );
         self.log.log(Direction::Tx, Some(&write.actor), &write.data);
         self.state
             .lock()
             .tx_bytes
             .fetch_add(write.data.len() as u64, Ordering::Relaxed);
         if let Some(completion) = write.completion {
-            let _ = completion.send(Ok(()));
+            let result = match evidence {
+                Ok(_) => Ok(()),
+                Err(error) if error.recorded_event().is_some() => Err(format!(
+                    "device write succeeded, but evidence persistence failed; do not retry: {error}"
+                )),
+                Err(error) => Err(format!(
+                    "device write succeeded, but evidence recording failed; do not retry: {error}"
+                )),
+            };
+            let _ = completion.send(result);
         }
     }
 
@@ -626,6 +807,17 @@ impl Broker {
     /// outcome may be partial or unknown, so it is never counted as confirmed.
     pub(crate) fn on_device_tx_failed(&self, write: DeviceWrite, reason: impl Into<String>) {
         let reason = reason.into();
+        let _ = self.record_event(
+            write.connection_epoch,
+            EventPayload::Gap(GapPayload {
+                scope: GapScope::TxOutcome,
+                certainty: GapCertainty::PartialOrUnknown,
+                reason: reason.clone(),
+                bytes: Some(BytesPayload::from_bytes(&write.data)),
+                actor: Some(write.actor.clone()),
+                client_ids: vec![write.client_id.to_string()],
+            }),
+        );
         self.log.event(&format!(
             "tx_gap reason=device_write_failed certainty=unknown bytes={} error={reason}",
             write.data.len()
@@ -642,6 +834,18 @@ impl Broker {
     /// zero-device-side-effect result.
     pub(crate) fn on_device_tx_not_written(&self, write: DeviceWrite, reason: impl Into<String>) {
         let reason = reason.into();
+        let _ = self.record_event(
+            write.connection_epoch,
+            EventPayload::Control(ControlPayload {
+                actor: Some(write.actor.clone()),
+                name: "write_rejected".into(),
+                value: Some(format!(
+                    "client_id={} bytes={} reason={reason}",
+                    write.client_id,
+                    write.data.len()
+                )),
+            }),
+        );
         self.state.lock().tx_denies.fetch_add(1, Ordering::Relaxed);
         self.log.event(&format!(
             "tx_gap reason=write_rejected certainty=not_written bytes={} error={reason}",
@@ -995,10 +1199,21 @@ impl Broker {
             token: token.clone(),
             expires_at: expires,
         });
+        let expires_ms = g.policy.write_lock_ms;
+        let connection_epoch = g.connection_epoch;
+        drop(g);
         self.log.event(&format!("lock_granted owner={client}"));
+        let _ = self.record_event(
+            connection_epoch,
+            EventPayload::Control(ControlPayload {
+                actor: Some(client.to_string()),
+                name: "lease_acquired".into(),
+                value: Some(format!("ttl_ms={expires_ms}")),
+            }),
+        );
         Ok(WriteLockView {
             owner: client.to_string(),
-            expires_ms: g.policy.write_lock_ms,
+            expires_ms,
             lease_token: token,
         })
     }
@@ -1024,8 +1239,18 @@ impl Broker {
             expires_ms,
             lease_token: lock.token.clone(),
         };
+        let connection_epoch = g.connection_epoch;
+        drop(g);
         self.log
             .event(&format!("lock_renewed owner={}", view.owner));
+        let _ = self.record_event(
+            connection_epoch,
+            EventPayload::Control(ControlPayload {
+                actor: Some(view.owner.clone()),
+                name: "lease_renewed".into(),
+                value: Some(format!("ttl_ms={expires_ms}")),
+            }),
+        );
         Ok(view)
     }
 
@@ -1034,7 +1259,7 @@ impl Broker {
     pub fn release_lock(&self, lease_token: Option<&str>) -> Result<(), String> {
         let mut g = self.state.lock();
         let now = Instant::now();
-        match &g.lock {
+        let released = match &g.lock {
             Some(lock) if lock.active(now) => {
                 let Some(token) = lease_token else {
                     return Err("lease token is required".into());
@@ -1044,14 +1269,26 @@ impl Broker {
                 }
                 let owner = lock.owner.clone();
                 g.lock = None;
-                self.log.event(&format!("lock_released owner={owner}"));
-                Ok(())
+                Some((owner, g.connection_epoch))
             }
             _ => {
                 g.lock = None;
-                Ok(())
+                None
             }
+        };
+        drop(g);
+        if let Some((owner, connection_epoch)) = released {
+            self.log.event(&format!("lock_released owner={owner}"));
+            let _ = self.record_event(
+                connection_epoch,
+                EventPayload::Control(ControlPayload {
+                    actor: Some(owner),
+                    name: "lease_released".into(),
+                    value: None,
+                }),
+            );
         }
+        Ok(())
     }
 
     pub fn history_bytes(&self) -> Bytes {
@@ -1128,6 +1365,7 @@ pub type Done = oneshot::Sender<()>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::{EventPayload, EventQuery, GapScope};
     use crate::policy::Policy;
     use crate::policy::{SlowClientPolicy, TxMode};
 
@@ -1498,6 +1736,14 @@ mod tests {
         let error = writer.await.unwrap().unwrap_err();
         assert!(error.contains("partial or unknown"), "error={error}");
         assert_eq!(broker.snapshot().stats.tx_bytes, 0);
+        let events = broker.ledger().query(EventQuery::default()).events;
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.event, EventPayload::Tx(_))));
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            EventPayload::Gap(ref gap) if gap.scope == GapScope::TxOutcome
+        )));
     }
 
     #[tokio::test]
@@ -1559,6 +1805,64 @@ mod tests {
         assert!(error.contains("lease"), "error={error}");
         broker.on_device_tx_not_written(write, error);
         assert!(writer.await.unwrap().is_err());
+        let events = broker.ledger().query(EventQuery::default()).events;
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.event, EventPayload::Tx(_))));
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            EventPayload::Control(ref control) if control.name == "write_rejected"
+        )));
+    }
+
+    #[tokio::test]
+    async fn confirmed_tx_is_recorded_only_after_the_host_write_ack() {
+        let (broker, mut serial_rx) = test_broker(TxMode::QueueByLine);
+        let writer = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .api_write_confirmed_with_lease(
+                        "evidence-writer",
+                        Bytes::from_static(&[0x00, 0xff]),
+                        None,
+                    )
+                    .await
+            })
+        };
+        let write = serial_rx.recv().await.unwrap();
+        assert!(!broker
+            .ledger()
+            .query(EventQuery::default())
+            .events
+            .iter()
+            .any(|event| matches!(event.event, EventPayload::Tx(_))));
+        broker.on_device_tx_written(write);
+        writer.await.unwrap().unwrap();
+
+        let events = broker.ledger().query(EventQuery::default()).events;
+        let tx = events
+            .iter()
+            .find_map(|event| match &event.event {
+                EventPayload::Tx(tx) => Some(tx),
+                _ => None,
+            })
+            .expect("confirmed TX event");
+        assert_eq!(tx.actor, "evidence-writer");
+        assert_eq!(tx.bytes.decode().unwrap(), [0x00, 0xff]);
+    }
+
+    #[test]
+    fn lease_credentials_never_enter_the_event_ledger() {
+        let (broker, _serial_rx) = test_broker(TxMode::QueueByLine);
+        let lease = broker.acquire_lock("audit-owner").unwrap();
+        broker.renew_lock(&lease.lease_token).unwrap();
+        broker.release_lock(Some(&lease.lease_token)).unwrap();
+
+        let json =
+            serde_json::to_string(&broker.ledger().query(EventQuery::default()).events).unwrap();
+        assert!(!json.contains(&lease.lease_token));
+        assert!(!json.contains("lease_token"));
     }
 
     #[tokio::test]

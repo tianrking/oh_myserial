@@ -1,8 +1,9 @@
 //! Hub supervisor: wires config → serial + broker + clients.
 
 use crate::broker::{Broker, EndpointView, PortStatus};
-use crate::client::{spawn_api_server, spawn_tcp_listener, ApiState};
+use crate::client::{spawn_api_server_owned, spawn_tcp_listener, ApiServerHandle, ApiState};
 use crate::config::{ClientConfig, Config};
+use crate::ledger::{Ledger, LedgerOptions, MemoryOptions, StoreOptions};
 use crate::observe::SessionLog;
 use crate::policy::Policy;
 use crate::serial::SerialHub;
@@ -13,41 +14,100 @@ use crate::client::{prepare_pty_client, PreparedPtyClient};
 pub struct HubHandle {
     serial: SerialHub,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    api_servers: Vec<ApiServerHandle>,
     pub broker: Broker,
+    stopped: bool,
 }
 
-struct StartupTasks(Vec<tokio::task::JoinHandle<()>>);
+struct StartupTasks {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    api_servers: Vec<ApiServerHandle>,
+}
 
 impl StartupTasks {
     fn new() -> Self {
-        Self(Vec::new())
+        Self {
+            tasks: Vec::new(),
+            api_servers: Vec::new(),
+        }
     }
 
     fn push(&mut self, task: tokio::task::JoinHandle<()>) {
-        self.0.push(task);
+        self.tasks.push(task);
     }
 
-    fn finish(mut self) -> Vec<tokio::task::JoinHandle<()>> {
-        std::mem::take(&mut self.0)
+    fn push_api(&mut self, server: ApiServerHandle) {
+        self.api_servers.push(server);
+    }
+
+    fn finish(mut self) -> (Vec<tokio::task::JoinHandle<()>>, Vec<ApiServerHandle>) {
+        (
+            std::mem::take(&mut self.tasks),
+            std::mem::take(&mut self.api_servers),
+        )
     }
 }
 
 impl Drop for StartupTasks {
     fn drop(&mut self) {
-        for task in self.0.drain(..) {
+        for server in &self.api_servers {
+            server.cancel();
+        }
+        for task in self.tasks.drain(..) {
             task.abort();
         }
+        self.api_servers.clear();
     }
 }
 
 impl HubHandle {
     fn stop_all(&mut self) {
+        if self.stopped {
+            return;
+        }
+        let _ = self.broker.record_control(None, "hub_stopping", None);
+        for server in &self.api_servers {
+            server.cancel();
+        }
         for t in self.tasks.drain(..) {
             t.abort();
         }
+        self.api_servers.clear();
         self.serial.stop();
+        self.seal_ledger();
+        self.stopped = true;
     }
 
+    fn seal_ledger(&self) {
+        if let Err(error) = self.broker.ledger().seal() {
+            tracing::error!("ledger seal failed during hub shutdown: {error}");
+        }
+    }
+
+    /// Stop endpoints, wait for their registration guards to run, stop the
+    /// serial owner, and only then seal the evidence ledger.
+    pub async fn shutdown_gracefully(mut self) {
+        let _ = self.broker.record_control(None, "hub_stopping", None);
+        for server in &self.api_servers {
+            server.cancel();
+        }
+        for task in &self.tasks {
+            task.abort();
+        }
+        for task in self.tasks.drain(..) {
+            let _ = task.await;
+        }
+        for server in self.api_servers.drain(..) {
+            if let Err(error) = server.shutdown().await {
+                tracing::warn!("api shutdown task failed: {error}");
+            }
+        }
+        self.serial.stop();
+        self.seal_ledger();
+        self.stopped = true;
+    }
+
+    /// Immediate synchronous fallback for non-async embedders.
     pub fn shutdown(mut self) {
         self.stop_all();
     }
@@ -67,6 +127,21 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
     let policy = Policy::from_config(&cfg.tx)?;
     let log = SessionLog::from_config(&cfg.log)?;
     log.event("hub_starting");
+    let ledger = Ledger::open(LedgerOptions {
+        session_id: None,
+        memory: MemoryOptions {
+            max_events: cfg.ledger.memory_events,
+            max_bytes: cfg.ledger.memory_bytes,
+        },
+        stream_capacity: cfg.ledger.stream_capacity,
+        store: cfg.ledger.directory.clone().map(|directory| StoreOptions {
+            directory,
+            segment_max_bytes: cfg.ledger.rotate_bytes,
+            segment_max_events: 100_000,
+            flush_every_events: 1,
+            fsync_on_flush: cfg.ledger.fsync_each_event,
+        }),
+    })?;
 
     let history_cap = cfg
         .clients
@@ -85,9 +160,10 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
         detail: "starting".into(),
     };
 
-    let split = Broker::new(policy, port, log.clone(), history_cap, 256);
+    let split = Broker::new_with_ledger(policy, port, log.clone(), history_cap, 256, ledger);
     let broker = split.broker;
     let serial_rx = split.serial_tx_rx;
+    let _ = broker.record_control(None, "hub_starting", None);
 
     // Publish endpoint catalog (1 real → many virtual / network endpoints).
     let endpoints: Vec<EndpointView> = cfg
@@ -152,7 +228,7 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
             ws_can_read,
             ws_can_write,
         };
-        tasks.push(spawn_api_server(st, cfg.api.bind.clone()).await?);
+        tasks.push_api(spawn_api_server_owned(st, cfg.api.bind.clone()).await?);
     }
 
     for client in &cfg.clients {
@@ -196,7 +272,7 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
                             ws_can_read: *can_read,
                             ws_can_write: *can_write,
                         };
-                        tasks.push(spawn_api_server(st, bind.clone()).await?);
+                        tasks.push_api(spawn_api_server_owned(st, bind.clone()).await?);
                     } else {
                         tracing::info!(
                             "websocket client '{name}' served by global api on {}",
@@ -247,6 +323,7 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
     // Give mock/serial a moment to open.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     log.event("hub_ready");
+    let _ = broker.record_control(None, "hub_ready", None);
     tracing::info!(
         "ohmyserial hub ready (real={} → {} fan-out endpoints)",
         cfg.real.path,
@@ -256,10 +333,13 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
     // Always print a plain human guide (not only tracing).
     eprint!("{}", cfg.connect_guide());
 
+    let (tasks, api_servers) = tasks.finish();
     Ok(HubHandle {
         serial,
-        tasks: tasks.finish(),
+        tasks,
+        api_servers,
         broker,
+        stopped: false,
     })
 }
 

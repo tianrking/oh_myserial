@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use ohmyserial::config::{Config, QuickShare};
+use ohmyserial::replay::{ReplayMode, ReplayOptions, ReplaySession};
 use ohmyserial::{hub, serial};
 
 #[derive(Parser, Debug)]
@@ -89,6 +90,20 @@ enum Commands {
         /// Show only fan-out endpoints
         #[arg(long, default_value_t = false)]
         endpoints: bool,
+    },
+    /// Replay a verified event-ledger capture without opening a serial device.
+    Replay {
+        /// A sealed .omslog segment or a directory containing one session.
+        source: PathBuf,
+        /// immediate, original (recorded timing), or manual (press Enter to step).
+        #[arg(long, default_value = "immediate", value_parser = ["immediate", "original", "manual"])]
+        mode: String,
+        /// Timing multiplier for original mode (0.01 through 100).
+        #[arg(long, default_value_t = 1.0)]
+        speed: f64,
+        /// Events emitted per Enter keypress in manual mode.
+        #[arg(long, default_value_t = 1)]
+        step: usize,
     },
 }
 
@@ -219,7 +234,67 @@ async fn main() -> anyhow::Result<()> {
             println!("{body}");
             Ok(())
         }
+        Commands::Replay {
+            source,
+            mode,
+            speed,
+            step,
+        } => replay_capture(source, &mode, speed, step).await,
     }
+}
+
+async fn replay_capture(
+    source: PathBuf,
+    mode: &str,
+    speed: f64,
+    step: usize,
+) -> anyhow::Result<()> {
+    let mode = mode.parse::<ReplayMode>()?;
+    let options = ReplayOptions { mode, speed }.validate()?;
+    let session = ReplaySession::load(&source)?;
+    eprintln!(
+        "verified replay session={} events={} seq={}..{} mode={} speed={}x",
+        session.session_id(),
+        session.len(),
+        session.first_seq(),
+        session.last_seq(),
+        mode,
+        speed
+    );
+
+    if mode == ReplayMode::Manual {
+        anyhow::ensure!(step > 0, "--step must be greater than zero");
+        let mut cursor = session.manual_cursor();
+        let stdin = std::io::stdin();
+        let mut input = String::new();
+        while !cursor.is_finished() {
+            eprint!(
+                "press Enter for up to {step} event(s), or q then Enter to stop [{} remaining]: ",
+                cursor.remaining()
+            );
+            use std::io::Write as _;
+            std::io::stderr().flush()?;
+            input.clear();
+            if stdin.read_line(&mut input)? == 0 || input.trim().eq_ignore_ascii_case("q") {
+                break;
+            }
+            for event in cursor.step(step)? {
+                println!("{}", serde_json::to_string(&event)?);
+            }
+        }
+        return Ok(());
+    }
+
+    session
+        .play(options, |event| {
+            // EventEnvelope is emitted unchanged as one JSON object per line.
+            println!(
+                "{}",
+                serde_json::to_string(&event).expect("validated event must serialize")
+            );
+        })
+        .await?;
+    Ok(())
 }
 
 async fn run_until_ctrl_c(
@@ -251,7 +326,7 @@ async fn run_until_ctrl_c(
     tracing::info!("press Ctrl+C to stop");
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutting down");
-    handle.shutdown();
+    handle.shutdown_gracefully().await;
     Ok(())
 }
 
@@ -326,6 +401,13 @@ tcp_base_port = 8788
 tcp_name_prefix = "tcp"
 tcp_can_write = true
 tcp_can_read = true
+
+[ledger]
+# Always-on bounded memory evidence; uncomment directory for hashed NDJSON capture.
+memory_events = 16384
+memory_bytes = 33554432
+# directory = "./ohmyserial-ledger"
+rotate_bytes = 67108864
 
 [log]
 mirror_console = true

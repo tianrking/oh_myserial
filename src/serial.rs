@@ -235,6 +235,7 @@ fn io_loop(
             }
             Err(e) => {
                 tracing::warn!("serial read error: {e}");
+                broker.on_serial_read_gap(format!("serial read error: {e}"));
                 return true; // reconnect
             }
         }

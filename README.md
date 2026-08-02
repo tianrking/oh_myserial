@@ -61,6 +61,7 @@
 - [Configuration](#configuration)
 - [CLI reference](#cli-reference)
 - [HTTP & WebSocket API](#http--websocket-api)
+- [Event ledger & safe replay](#event-ledger--safe-replay)
 - [TX policies](#tx-policies)
 - [Unix PTY](#unix-pty-macos--linux)
 - [Windows notes](#windows-notes)
@@ -144,6 +145,8 @@ Device (UART/COM)
 | WebSocket stream | Live RX (+ optional history on connect) | ✅ |
 | Unix PTY | Symlinked virtual serial for classic tools | ✅ (macOS/Linux) |
 | Session log | Console + file; text / hex / hex+text | ✅ |
+| Event ledger | Versioned RX/TX/connection/control/gap evidence; bounded memory + optional hashed NDJSON | ✅ |
+| Safe replay | Verified, read-only `immediate` / `original` / `manual` replay | ✅ |
 | Mock port | `mock:demo` loopback without hardware | ✅ |
 | TOML config + CLI | `run` / `init` / `list-ports` / `status` | ✅ |
 | Multi-port single process | Multiple real profiles in one process | 🔜 |
@@ -159,6 +162,8 @@ Device (UART/COM)
 | Serial I/O | `serialport` + dedicated reader thread |
 | Config | Serde + TOML |
 | Logging | `tracing` + session blog |
+| Evidence | Canonical v1 ledger + SHA-256-chained NDJSON segments |
+| Replay | Verified envelopes only; isolated from the live broker and serial writer |
 | Unix PTY | `nix` openpty + symlink |
 | Tests | Unit + integration (mock hub) |
 | CI | GitHub Actions: Ubuntu · macOS · Windows |
@@ -189,7 +194,9 @@ CLI / Config
             ├── Broker (registry, fan-out, TX queue)
             ├── Policy (queue_by_line / exclusive / …)
             ├── Clients: PTY · TCP · HTTP/WS
-            └── Observe (session log, tracing)
+            ├── Ledger (ordered evidence, bounded ring, optional segments)
+            ├── Replay (verified, read-only, offline)
+            └── Observe (human log, tracing)
 ```
 
 ---
@@ -451,6 +458,14 @@ tcp_base_port = 8788
 # name = "ui"
 # link = "/tmp/ohmyserial-ui"
 
+[ledger]
+memory_events = 16384
+memory_bytes = 33554432
+stream_capacity = 1024
+# directory = "./ohmyserial-ledger"  # opt in to hashed NDJSON persistence
+rotate_bytes = 67108864
+fsync_each_event = false
+
 [log]
 mirror_console = true
 format = "hex+text"
@@ -467,6 +482,10 @@ format = "hex+text"
 | `api.bind` | HTTP/WS; plaintext listeners are restricted to loopback |
 | `api.token_env` | Name of the environment variable containing the API bearer secret |
 | `api.cors_origins` | Exact browser origins; empty means same-origin only, and `*` is rejected |
+| `ledger.memory_events` / `memory_bytes` | Always-on bounded event evidence ring |
+| `ledger.directory` | Optional append-only hashed NDJSON persistence root |
+| `ledger.stream_capacity` / `rotate_bytes` | Live event subscriber bound / sealed segment size target |
+| `ledger.fsync_each_event` | Force each event through the OS storage cache; safer but slower |
 | `clients[]` | Explicit endpoints (optional) |
 
 ---
@@ -478,6 +497,9 @@ ohmyserial run -c ohmyserial.toml    # start hub
 ohmyserial init [-o file]           # sample config to stdout/file
 ohmyserial list-ports               # list serial devices
 ohmyserial status [--api URL]       # GET /v1/status
+ohmyserial replay <source>          # verify and emit a sealed ledger capture
+ohmyserial replay <source> --mode original --speed 2
+ohmyserial replay <source> --mode manual --step 10
 ```
 
 ```bash
@@ -500,10 +522,14 @@ Browser access is same-origin by default. Requests must also carry a Host author
 | `GET` | `/v1/status` | Port, endpoints, clients, lock, stats |
 | `GET` | `/v1/endpoints` | Configured fan-out endpoints catalog |
 | `GET` | `/v1/clients` | Connected client list |
+| `GET` | `/v1/events/status` | Ledger session, ring, persistence, and recovery status |
+| `GET` | `/v1/events` | Cursor query with type/epoch/actor/byte filters |
+| `GET` | `/v1/events/export` | Canonical event NDJSON export |
 | `POST` | `/v1/write` | Send text or hex to device |
 | `POST` | `/v1/lock` | Acquire write lock |
 | `DELETE` | `/v1/lock` | Release write lock |
 | `WS` | `/v1/stream` | Live RX stream |
+| `WS` | `/v1/events/stream` | Read-only JSON event envelopes: snapshot then live |
 
 ### Write
 
@@ -561,6 +587,26 @@ req = urllib.request.Request(
 )
 print(urllib.request.urlopen(req).read().decode())
 ```
+
+---
+
+## Event ledger & safe replay
+
+Every run has an ordered v1 evidence stream covering byte-exact RX observed by the process, host-confirmed TX, connection generations, control actions, and explicit uncertainty gaps. The bounded memory ring is always active; setting `ledger.directory` adds rotated, SHA-256-chained NDJSON segments, conservative crash recovery, and complete disk-backed query/export.
+
+```bash
+# Query canonical events after an exclusive sequence cursor.
+curl -s 'http://127.0.0.1:8787/v1/events?after_seq=0&limit=100&type=rx,tx'
+
+# Replay a sealed segment or a directory containing exactly one session.
+ohmyserial replay ./one-session-directory --mode original --speed 2
+```
+
+The raw `/v1/stream` WebSocket carries bidirectional serial bytes. `/v1/events/stream` is separate: it emits read-only JSON text envelopes and supports cursor/filter catch-up. Replay verifies sealed input and only prints the original envelopes; it never opens a device or sends recorded TX back into the live broker.
+
+Segment hashes detect corruption and broken chains, but they are not signatures or proof of origin. There is no automatic retention deletion. RX evidence begins when the process successfully reads bytes; loss in hardware or a driver before that point may be unknowable. Host-side TX `write_all` + `flush` is not a device acknowledgement. Mock tests are not hardware-in-the-loop tests.
+
+See [`EVENTS.md`](./EVENTS.md) for the complete envelope, event types, gap semantics, storage/recovery model, API pagination and WebSocket recovery flow, and replay safety contract.
 
 ---
 
@@ -624,7 +670,8 @@ Open `/tmp/ohmyserial-ui` in minicom, screen, Serial Studio, etc.
 - Default binds are **localhost only** (`127.0.0.1`)  
 - Serial TX can reset boards / send dangerous commands — treat as privileged  
 - Plaintext API, WebSocket, and raw TCP listeners are loopback-only; use SSH or a TLS reverse proxy for remote access
-- Logs may contain secrets from the device stream  
+- Human logs, event segments, and exports may contain secrets from the device stream
+- Segment hashes detect corruption; they do not authenticate who produced or modified a capture
 
 ---
 
@@ -636,6 +683,7 @@ oh_myserial/
 ├── README.zh-CN.md
 ├── README.es.md
 ├── POSITIONING.md
+├── EVENTS.md                 # Canonical event ledger, persistence, API, replay
 ├── ohmyserial.example.toml
 ├── web/                      # Optional React console (Traditional Chinese)
 │   ├── PROTOCOL.zh-TW.md     # Full HTTP/WS protocol
@@ -683,9 +731,10 @@ CI: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) — Ubuntu, macOS, 
 
 | Phase | Scope |
 |-------|--------|
-| ✅ MVP | Hub core, policies, TCP, HTTP/WS, Unix PTY, mock, logs, CLI |
-| 🔜 Next | Multi-port, richer history, Windows COM bridge guide, hardening |
-| 🧭 Later | RFC2217, record/replay, light web monitor, metrics |
+| ✅ Foundation | Hub core, trusted TX, leases, TCP, HTTP/WS, Unix PTY, mock, logs, CLI |
+| ✅ Evidence | Canonical event ledger, optional hashed segments, query/export/event WS, safe replay |
+| 🔜 Next | Controlled workflows, device identity/control lines, handoff, multi-port supervision |
+| 🧭 Later | RFC2217, Windows COM bridge guide, richer web evidence tooling, metrics |
 
 Not core goals: cloud SaaS, heavy GUI installer, kernel virtual-COM driver (unless demand is clear).
 

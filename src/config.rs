@@ -17,6 +17,10 @@ pub struct Config {
     pub fanout: FanoutConfig,
     #[serde(default)]
     pub log: LogConfig,
+    /// Canonical, byte-lossless event evidence. It is always retained in a
+    /// bounded memory ring; disk persistence is opt-in via `directory`.
+    #[serde(default)]
+    pub ledger: LedgerConfig,
     /// Optional HTTP/WS control plane bind (also used when a websocket client has no bind).
     #[serde(default)]
     pub api: ApiConfig,
@@ -203,6 +207,37 @@ pub struct LogConfig {
     pub format: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerConfig {
+    /// Optional root directory for hashed NDJSON session segments.
+    #[serde(default)]
+    pub directory: Option<PathBuf>,
+    #[serde(default = "default_ledger_memory_events")]
+    pub memory_events: usize,
+    #[serde(default = "default_ledger_memory_bytes")]
+    pub memory_bytes: usize,
+    #[serde(default = "default_ledger_stream_capacity")]
+    pub stream_capacity: usize,
+    #[serde(default = "default_ledger_rotate_bytes")]
+    pub rotate_bytes: u64,
+    /// Stronger durability at the cost of a disk sync for every event.
+    #[serde(default)]
+    pub fsync_each_event: bool,
+}
+
+impl Default for LedgerConfig {
+    fn default() -> Self {
+        Self {
+            directory: None,
+            memory_events: default_ledger_memory_events(),
+            memory_bytes: default_ledger_memory_bytes(),
+            stream_capacity: default_ledger_stream_capacity(),
+            rotate_bytes: default_ledger_rotate_bytes(),
+            fsync_each_event: false,
+        }
+    }
+}
+
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
@@ -272,6 +307,7 @@ impl Default for Config {
             }],
             fanout: FanoutConfig::default(),
             log: LogConfig::default(),
+            ledger: LedgerConfig::default(),
             api: ApiConfig::default(),
         }
     }
@@ -397,6 +433,7 @@ impl Config {
                 mirror_console: q.mirror_console,
                 format: "hex+text".into(),
             },
+            ledger: LedgerConfig::default(),
             api: ApiConfig {
                 bind: q.api_bind,
                 enabled: true,
@@ -688,6 +725,18 @@ impl Config {
         if self.tx.slow_block_ms == 0 {
             anyhow::bail!("tx.slow_block_ms must be at least 1");
         }
+        if self.ledger.memory_events == 0 {
+            anyhow::bail!("ledger.memory_events must be at least 1");
+        }
+        if self.ledger.memory_bytes == 0 {
+            anyhow::bail!("ledger.memory_bytes must be at least 1");
+        }
+        if self.ledger.stream_capacity == 0 {
+            anyhow::bail!("ledger.stream_capacity must be at least 1");
+        }
+        if self.ledger.rotate_bytes < 1024 {
+            anyhow::bail!("ledger.rotate_bytes must be at least 1024");
+        }
         match self.log.format.as_str() {
             "text" | "hex" | "hex+text" => {}
             other => anyhow::bail!("unknown log.format: {other}"),
@@ -865,6 +914,18 @@ fn default_history_bytes() -> usize {
 fn default_log_format() -> String {
     "hex+text".into()
 }
+fn default_ledger_memory_events() -> usize {
+    16_384
+}
+fn default_ledger_memory_bytes() -> usize {
+    32 * 1024 * 1024
+}
+fn default_ledger_stream_capacity() -> usize {
+    1024
+}
+fn default_ledger_rotate_bytes() -> u64 {
+    64 * 1024 * 1024
+}
 fn default_pty_link_prefix() -> String {
     "/tmp/ohmyserial-v".into()
 }
@@ -891,6 +952,41 @@ mod tests {
     #[test]
     fn default_config_validates() {
         Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn ledger_capacity_and_rotation_limits_are_validated() {
+        let mut cfg = Config::default();
+        cfg.ledger.memory_events = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("memory_events"));
+
+        cfg.ledger.memory_events = 1;
+        cfg.ledger.memory_bytes = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("memory_bytes"));
+
+        cfg.ledger.memory_bytes = 1;
+        cfg.ledger.stream_capacity = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("stream_capacity"));
+
+        cfg.ledger.stream_capacity = 1;
+        cfg.ledger.rotate_bytes = 1023;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("rotate_bytes"));
     }
 
     #[test]

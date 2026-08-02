@@ -1,11 +1,12 @@
 //! HTTP + WebSocket control/data plane for agents.
 
+use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::Request;
 use axum::extract::State;
+use axum::extract::{Query, Request};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HOST, ORIGIN, SEC_WEBSOCKET_PROTOCOL};
 use axum::http::uri::Authority;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -22,6 +23,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::broker::{Broker, WriteLockView};
 use crate::client::static_ui::{static_handler, ui_embedded};
+use crate::ledger::{EventFilter, EventQuery, EventType, QueryPage};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -125,6 +127,10 @@ pub async fn spawn_api_server_owned(
         .route("/v1/status", get(status))
         .route("/v1/clients", get(clients))
         .route("/v1/endpoints", get(endpoints))
+        .route("/v1/events/status", get(events_status))
+        .route("/v1/events", get(events_query))
+        .route("/v1/events/export", get(events_export))
+        .route("/v1/events/stream", get(events_stream))
         .route("/v1/write", post(write))
         .route("/v1/lock", post(lock).delete(unlock))
         // Unlimited concurrent agents/monitors share the same stream path.
@@ -367,6 +373,381 @@ async fn endpoints(State(st): State<Arc<ApiState>>) -> Response {
         "connected_clients": snap.clients.len(),
     }))
     .into_response()
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct EventsParams {
+    #[serde(default)]
+    after_seq: u64,
+    through_seq: Option<u64>,
+    limit: Option<usize>,
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+    connection_epoch: Option<u64>,
+    actor: Option<String>,
+    contains_hex: Option<String>,
+}
+
+async fn events_status(State(st): State<Arc<ApiState>>) -> Response {
+    if !st.can_read {
+        return permission_denied("event read access");
+    }
+    Json(st.broker.ledger().status()).into_response()
+}
+
+fn event_query_from_params(params: EventsParams) -> Result<EventQuery, String> {
+    let mut event_types = BTreeSet::new();
+    if let Some(value) = params.event_type {
+        for value in value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let event_type = match value {
+                "rx" => EventType::Rx,
+                "tx" => EventType::Tx,
+                "connection" => EventType::Connection,
+                "control" => EventType::Control,
+                "gap" => EventType::Gap,
+                _ => return Err(format!("unknown event type '{value}'")),
+            };
+            event_types.insert(event_type);
+        }
+    }
+    let contains_bytes = match params.contains_hex {
+        Some(value) => {
+            let bytes = parse_hex(&value)?;
+            if bytes.is_empty() {
+                return Err("contains_hex must not be empty".into());
+            }
+            Some(bytes)
+        }
+        None => None,
+    };
+    if params.actor.as_ref().is_some_and(|actor| {
+        actor.is_empty() || actor.len() > 128 || actor.chars().any(char::is_control)
+    }) {
+        return Err("actor must be 1..=128 non-control characters".into());
+    }
+    Ok(EventQuery {
+        after_seq: params.after_seq,
+        through_seq: params.through_seq,
+        limit: params.limit.unwrap_or(1_000).clamp(1, 1_000),
+        filter: EventFilter {
+            event_types,
+            connection_epoch: params.connection_epoch,
+            actor: params.actor,
+            contains_bytes,
+        },
+    })
+}
+
+fn page_from_persisted(
+    events: &[crate::ledger::EventEnvelope],
+    query: &EventQuery,
+    newest_seq: u64,
+) -> QueryPage {
+    let oldest = events.first().map(|event| event.seq);
+    let requested_next = query.after_seq.saturating_add(1);
+    let incomplete =
+        newest_seq >= requested_next && oldest.is_none_or(|oldest_seq| requested_next < oldest_seq);
+    let missing_through_seq = incomplete.then(|| oldest.unwrap_or(newest_seq + 1) - 1);
+    let limit = query.limit.clamp(1, 1_000);
+    let upper = query.through_seq.unwrap_or(newest_seq);
+    let mut selected = Vec::new();
+    let mut cursor = query.after_seq;
+    for event in events {
+        if event.seq <= query.after_seq {
+            continue;
+        }
+        if event.seq > upper {
+            break;
+        }
+        cursor = event.seq;
+        if query.filter.matches(event) {
+            selected.push(event.clone());
+            if selected.len() == limit {
+                break;
+            }
+        }
+    }
+    let has_more = events
+        .iter()
+        .any(|event| event.seq > cursor && event.seq <= upper && query.filter.matches(event));
+    QueryPage {
+        events: selected,
+        incomplete,
+        missing_through_seq,
+        oldest_available_seq: oldest,
+        newest_seq,
+        next_after_seq: cursor,
+        has_more,
+    }
+}
+
+async fn authoritative_event_page(
+    ledger: crate::ledger::Ledger,
+    query: EventQuery,
+) -> Result<QueryPage, String> {
+    let memory_page = ledger.query(query.clone());
+    if !memory_page.incomplete || ledger.persistence_directory().is_none() {
+        return Ok(memory_page);
+    }
+    let high_water = memory_page.newest_seq;
+    tokio::task::spawn_blocking(move || {
+        ledger.checkpoint().map_err(|error| error.to_string())?;
+        let persisted = ledger
+            .read_persisted_session()
+            .map_err(|error| error.to_string())?;
+        Ok(page_from_persisted(&persisted.events, &query, high_water))
+    })
+    .await
+    .map_err(|error| format!("event query worker failed: {error}"))?
+}
+
+async fn events_query(
+    State(st): State<Arc<ApiState>>,
+    Query(params): Query<EventsParams>,
+) -> Response {
+    if !st.can_read {
+        return permission_denied("event read access");
+    }
+    let query = match event_query_from_params(params) {
+        Ok(query) => query,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": error,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let ledger = st.broker.ledger();
+    let session_id = ledger.session_id();
+    match authoritative_event_page(ledger, query).await {
+        Ok(page) if page.incomplete => (
+            StatusCode::GONE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "requested event cursor is no longer available",
+                "session_id": session_id,
+                "page": page,
+            })),
+        )
+            .into_response(),
+        Ok(page) => Json(serde_json::json!({
+            "ok": true,
+            "session_id": session_id,
+            "page": page,
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response(),
+    }
+}
+
+async fn events_export(State(st): State<Arc<ApiState>>) -> Response {
+    if !st.can_read {
+        return permission_denied("event export access");
+    }
+    let ledger = st.broker.ledger();
+    let exported = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let status = ledger.status();
+        let events = if ledger.persistence_directory().is_some() {
+            ledger.checkpoint().map_err(|error| error.to_string())?;
+            ledger
+                .read_persisted_session()
+                .map_err(|error| error.to_string())?
+                .events
+        } else {
+            let page = ledger.query(EventQuery {
+                after_seq: 0,
+                through_seq: Some(status.newest_seq),
+                limit: 100_000,
+                filter: EventFilter::default(),
+            });
+            if page.incomplete || page.has_more {
+                return Err(
+                    "complete export is unavailable after the in-memory ledger was evicted".into(),
+                );
+            }
+            page.events
+        };
+        let mut output = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut output, &event).map_err(|error| error.to_string())?;
+            output.push(b'\n');
+        }
+        Ok(output)
+    })
+    .await;
+    match exported {
+        Ok(Ok(bytes)) => (
+            [(CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(error)) => (
+            StatusCode::GONE,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("event export worker failed: {error}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn events_stream(
+    ws: WebSocketUpgrade,
+    State(st): State<Arc<ApiState>>,
+    Extension(shutdown): Extension<CancellationToken>,
+    Query(params): Query<EventsParams>,
+    headers: HeaderMap,
+) -> Response {
+    if !st.can_read {
+        return permission_denied("event stream access");
+    }
+    if !websocket_origin_allowed(&headers, &st.cors_origins) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "WebSocket origin is not allowed",
+            })),
+        )
+            .into_response();
+    }
+    let mut query = match event_query_from_params(params) {
+        Ok(query) => query,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": error,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let ledger = st.broker.ledger();
+    let live = ledger.subscribe();
+    let high_water = ledger.status().newest_seq;
+    let through_seq = query.through_seq;
+    let live_filter = query.filter.clone();
+    query.through_seq = Some(through_seq.unwrap_or(high_water).min(high_water));
+    query.limit = 100_000;
+    let snapshot = ledger.query(query);
+    if snapshot.incomplete || snapshot.has_more {
+        return (
+            StatusCode::GONE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "event stream cursor requires query backfill before subscribing",
+                "page": snapshot,
+            })),
+        )
+            .into_response();
+    }
+    let upgrade = if websocket_protocol_bearer(&headers).is_some() {
+        ws.protocols(["bearer"])
+    } else {
+        ws
+    };
+    upgrade
+        .on_upgrade(move |socket| {
+            handle_events_ws(
+                socket,
+                ledger,
+                live,
+                snapshot,
+                live_filter,
+                through_seq,
+                shutdown,
+            )
+        })
+        .into_response()
+}
+
+async fn handle_events_ws(
+    mut socket: WebSocket,
+    ledger: crate::ledger::Ledger,
+    mut live: tokio::sync::broadcast::Receiver<crate::ledger::EventEnvelope>,
+    snapshot: QueryPage,
+    filter: EventFilter,
+    through_seq: Option<u64>,
+    shutdown: CancellationToken,
+) {
+    let mut cursor = snapshot.next_after_seq;
+    for event in snapshot.events {
+        cursor = cursor.max(event.seq);
+        let Ok(text) = serde_json::to_string(&event) else {
+            return;
+        };
+        if socket.send(Message::Text(text.into())).await.is_err() {
+            return;
+        }
+    }
+    if through_seq.is_some_and(|through_seq| cursor >= through_seq) {
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                let _ = socket.send(Message::Close(None)).await;
+                break;
+            }
+            event = live.recv() => match event {
+                Ok(event) if event.seq <= cursor => {}
+                Ok(event) => {
+                    cursor = event.seq;
+                    if through_seq.is_none_or(|through_seq| event.seq <= through_seq)
+                        && filter.matches(&event)
+                    {
+                        let Ok(text) = serde_json::to_string(&event) else { break };
+                        if socket.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    if through_seq.is_some_and(|through_seq| event.seq >= through_seq) {
+                        let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let status = ledger.status();
+                    let gap = serde_json::json!({
+                        "schema": "ohmyserial.stream-gap",
+                        "version": 1,
+                        "after_seq": cursor,
+                        "earliest_available_seq": status.oldest_available_seq,
+                        "latest_seq": status.newest_seq,
+                    });
+                    let _ = socket.send(Message::Text(gap.to_string().into())).await;
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            inbound = socket.recv() => match inbound {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(_)) => {}
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

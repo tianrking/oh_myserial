@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Event ledger and safe replay
+
+- Added a canonical `ohmyserial.event` v1 envelope with session sequence, UTC/monotonic time, port connection epoch, typed RX/TX/connection/control/gap payloads, and standard padded Base64 byte encoding.
+- Added an always-on event/byte-bounded memory ring plus read status, cursor query, filtered catch-up, NDJSON export, and read-only snapshot-then-live event WebSocket APIs.
+- Added opt-in append-only NDJSON persistence with size/event rotation, SHA-256 content and cross-segment chain verification, checkpointing, per-session locking, and conservative stale `.open` recovery that preserves source files.
+- Added verified offline replay in immediate, original-timing, and manual-step modes. Replay emits unchanged envelopes and has no path to the live broker, serial owner, leases, or device writes.
+- Documented that hashes detect corruption but are not signatures, retention deletion is operator-owned, process-observed RX starts after the driver read boundary, host-confirmed TX is not a device acknowledgement, and mock coverage is not hardware-in-the-loop evidence.
+
 ### Trusted serial core
 
 - Added credentialed write leases: acquire returns a random opaque `lease_token`; renew, protected writes, and release require that token. Owner names are display/audit labels and disconnect no longer releases a lease by name.

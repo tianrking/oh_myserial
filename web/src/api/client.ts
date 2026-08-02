@@ -2,6 +2,9 @@ import type {
   ConnectionConfig,
   EndpointsResponse,
   HealthResponse,
+  LedgerEventsQuery,
+  LedgerEventsResponse,
+  LedgerStatus,
   LockResponse,
   StatusSnapshot,
   WriteResponse,
@@ -12,10 +15,15 @@ function authHeaders(bearerToken?: string): Record<string, string> {
   return bearerToken ? { authorization: `Bearer ${bearerToken}` } : {};
 }
 
-async function getJson<T>(url: string, bearerToken?: string): Promise<T> {
+async function getJson<T>(
+  url: string,
+  bearerToken?: string,
+  signal?: AbortSignal,
+): Promise<T> {
   const res = await fetch(url, {
     method: "GET",
     headers: authHeaders(bearerToken),
+    signal,
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
   return res.json() as Promise<T>;
@@ -39,6 +47,21 @@ async function sendJson<T>(
   return res.json() as Promise<T>;
 }
 
+function eventQueryString(query: LedgerEventsQuery): string {
+  const params = new URLSearchParams();
+  if (query.afterSeq !== undefined) params.set("after_seq", String(query.afterSeq));
+  if (query.throughSeq !== undefined) params.set("through_seq", String(query.throughSeq));
+  if (query.limit !== undefined) params.set("limit", String(query.limit));
+  if (query.types?.length) params.set("type", query.types.join(","));
+  if (query.connectionEpoch !== undefined) {
+    params.set("connection_epoch", String(query.connectionEpoch));
+  }
+  if (query.actor) params.set("actor", query.actor);
+  if (query.containsHex) params.set("contains_hex", query.containsHex);
+  const encoded = params.toString();
+  return encoded ? `?${encoded}` : "";
+}
+
 export const hubApi = {
   health: (cfg: ConnectionConfig) =>
     getJson<HealthResponse>(`${httpBase(cfg)}/v1/health`),
@@ -51,6 +74,29 @@ export const hubApi = {
 
   clients: (cfg: ConnectionConfig, bearerToken?: string) =>
     getJson<StatusSnapshot["clients"]>(`${httpBase(cfg)}/v1/clients`, bearerToken),
+
+  eventsStatus: (
+    cfg: ConnectionConfig,
+    bearerToken?: string,
+    signal?: AbortSignal,
+  ) =>
+    getJson<LedgerStatus>(
+      `${httpBase(cfg)}/v1/events/status`,
+      bearerToken,
+      signal,
+    ),
+
+  events: (
+    cfg: ConnectionConfig,
+    query: LedgerEventsQuery,
+    bearerToken?: string,
+    signal?: AbortSignal,
+  ) =>
+    getJson<LedgerEventsResponse>(
+      `${httpBase(cfg)}/v1/events${eventQueryString(query)}`,
+      bearerToken,
+      signal,
+    ),
 
   writeText: (
     cfg: ConnectionConfig,

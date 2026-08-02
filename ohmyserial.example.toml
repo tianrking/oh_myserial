@@ -80,6 +80,17 @@ tcp_can_read = true
 # can_write = true
 # can_read = true
 
+[ledger]
+# Canonical v1 events are always kept in a bounded memory ring.
+memory_events = 16384
+memory_bytes = 33554432
+stream_capacity = 1024
+# Disk capture is opt-in. When enabled, the hub writes hashed, crash-recoverable
+# NDJSON segments and never silently deletes old segments.
+# directory = "./ohmyserial-ledger"
+rotate_bytes = 67108864
+fsync_each_event = false
+
 [log]
 mirror_console = true
 format = "hex+text"

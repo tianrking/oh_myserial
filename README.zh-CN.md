@@ -59,6 +59,7 @@
 - [配置说明](#配置说明)
 - [命令行](#命令行)
 - [HTTP / WebSocket API](#http--websocket-api)
+- [事件账本与安全回放](#事件账本与安全回放)
 - [发送策略（TX）](#发送策略tx)
 - [Unix 虚拟串口（PTY）](#unix-虚拟串口pty)
 - [Windows 说明](#windows-说明)
@@ -140,6 +141,8 @@
 | WebSocket | 实时 RX（可带历史） | ✅ |
 | Unix PTY | 符号链接虚拟串口 | ✅（macOS/Linux） |
 | 会话日志 | 控制台 + 文件；text/hex | ✅ |
+| 事件账本 | 版本化 RX/TX/连接/控制/gap 证据；有界内存 + 可选哈希 NDJSON | ✅ |
+| 安全回放 | 校验后只读的 `immediate` / `original` / `manual` 回放 | ✅ |
 | Mock 口 | `mock:demo` 无硬件回环 | ✅ |
 | TOML + CLI | `run` / `init` / `list-ports` / `status` | ✅ |
 | 单进程多真口 | 多 profile | 🔜 |
@@ -155,6 +158,8 @@
 | 串口 | `serialport` + 独立读线程 |
 | 配置 | Serde + TOML |
 | 日志 | `tracing` + 会话 blog |
+| 证据 | 规范 v1 账本 + SHA-256 链式 NDJSON 分段 |
+| 回放 | 只输出校验后的事件；与实时 Broker、串口写入隔离 |
 | Unix PTY | `nix` openpty |
 | 测试 | 单元 + 集成（mock） |
 | CI | Ubuntu · macOS · Windows |
@@ -185,7 +190,9 @@ CLI / 配置
             ├── Broker（注册、广播、TX 队列）
             ├── Policy（发送策略）
             ├── Clients：PTY · TCP · HTTP/WS
-            └── Observe（日志）
+            ├── Ledger（有序证据、有界 ring、可选持久化）
+            ├── Replay（校验后只读、离线）
+            └── Observe（人类可读日志）
 ```
 
 ---
@@ -382,6 +389,14 @@ history_bytes = 65536
 # name = "ui"
 # link = "/tmp/ohmyserial-ui"
 
+[ledger]
+memory_events = 16384
+memory_bytes = 33554432
+stream_capacity = 1024
+# directory = "./ohmyserial-ledger"  # 开启哈希 NDJSON 持久化
+rotate_bytes = 67108864
+fsync_each_event = false
+
 [log]
 mirror_console = true
 format = "hex+text"
@@ -397,6 +412,10 @@ format = "hex+text"
 | `api.bind` | HTTP/WS 地址；明文监听始终限制为回环地址 |
 | `api.token_env` | 保存 API Bearer 密钥的环境变量名，密钥不写入 TOML |
 | `api.cors_origins` | 精确的浏览器 Origin 白名单；空值仅同源，拒绝 `*` |
+| `ledger.memory_events` / `memory_bytes` | 始终启用的有界事件证据 ring |
+| `ledger.directory` | 可选的追加式哈希 NDJSON 持久化根目录 |
+| `ledger.stream_capacity` / `rotate_bytes` | 实时事件订阅上限 / 分段大小目标 |
+| `ledger.fsync_each_event` | 每个事件都强制进入系统存储缓存；更稳但更慢 |
 | `can_read` / `can_write` | 客户端权限 |
 
 ---
@@ -408,6 +427,9 @@ ohmyserial run -c ohmyserial.toml    # 启动 hub
 ohmyserial init [-o file]           # 生成示例配置
 ohmyserial list-ports               # 列出串口
 ohmyserial status [--api URL]       # 查询运行状态
+ohmyserial replay <source>          # 校验并输出封存的账本捕获
+ohmyserial replay <source> --mode original --speed 2
+ohmyserial replay <source> --mode manual --step 10
 ```
 
 ```bash
@@ -428,11 +450,16 @@ RUST_LOG=debug ohmyserial run -c ohmyserial.toml
 |------|------|------|
 | `GET` | `/v1/health` | 存活检查 |
 | `GET` | `/v1/status` | 串口/客户端/锁/统计 |
+| `GET` | `/v1/endpoints` | 已配置的并联端点 |
 | `GET` | `/v1/clients` | 客户端列表 |
+| `GET` | `/v1/events/status` | 账本会话、ring、持久化和恢复状态 |
+| `GET` | `/v1/events` | 按游标查询，可过滤类型/epoch/actor/字节 |
+| `GET` | `/v1/events/export` | 规范事件 NDJSON 导出 |
 | `POST` | `/v1/write` | 向设备发送 text 或 hex |
 | `POST` | `/v1/lock` | 申请写锁 |
 | `DELETE` | `/v1/lock` | 释放写锁 |
 | `WS` | `/v1/stream` | 实时 RX |
+| `WS` | `/v1/events/stream` | 只读 JSON 事件：先快照再实时 |
 
 ### 发送示例
 
@@ -486,6 +513,26 @@ req = urllib.request.Request(
 )
 print(urllib.request.urlopen(req).read().decode())
 ```
+
+---
+
+## 事件账本与安全回放
+
+每次运行都有一条有序的 v1 证据流，记录进程实际观察到的精确 RX 字节、主机侧确认完成的 TX、连接世代、控制动作和显式不确定性 `gap`。有界内存 ring 始终启用；设置 `ledger.directory` 后，还会写入轮转的 SHA-256 链式 NDJSON 分段，执行保守的崩溃恢复，并支持磁盘补全查询/导出。
+
+```bash
+# 从排他序号游标之后查询规范事件。
+curl -s 'http://127.0.0.1:8787/v1/events?after_seq=0&limit=100&type=rx,tx'
+
+# 回放一个封存分段，或只包含一个会话的目录。
+ohmyserial replay ./one-session-directory --mode original --speed 2
+```
+
+原始 `/v1/stream` WebSocket 承载双向串口字节；`/v1/events/stream` 是另一条只读通道，发送 JSON 文本事件并支持游标/过滤器。回放只会校验并输出原始事件，不会打开设备，也不会把历史 TX 重新送进实时 Broker。
+
+分段哈希能发现损坏和链断裂，但不是数字签名或来源证明；程序也不会自动删除旧分段。RX 证据从进程成功读到字节时才开始，硬件或驱动在此之前的丢失可能无法得知。主机侧 TX `write_all` + `flush` 不等于设备确认。Mock 测试也不等于硬件在环测试。
+
+完整的 envelope、事件类型、gap 语义、存储/恢复模型、API 分页与 WebSocket 补流流程、回放安全边界见 [`EVENTS.md`](./EVENTS.md)。
 
 ---
 
@@ -549,7 +596,8 @@ can_read = true
 - 默认只绑 **`127.0.0.1`**  
 - 串口写入等同于碰硬件（复位、危险指令）  
 - 明文 API、WebSocket 和原始 TCP 都只能监听回环地址；远程访问使用 SSH 或 TLS 反向代理
-- 日志可能含设备吐出的敏感信息  
+- 人类日志、事件分段和导出都可能含设备吐出的敏感信息
+- 分段哈希用于发现损坏，不能认证捕获的产生者或修改者
 
 ---
 
@@ -561,6 +609,7 @@ oh_myserial/
 ├── README.zh-CN.md     # 简体中文
 ├── README.es.md        # Español
 ├── POSITIONING.md
+├── EVENTS.md           # 规范事件账本、持久化、API、回放
 ├── ohmyserial.example.toml
 ├── src/ ...
 └── tests/
@@ -585,9 +634,10 @@ CI：Ubuntu · macOS · Windows。
 
 | 阶段 | 内容 |
 |------|------|
-| ✅ MVP | 核心 hub、策略、TCP、HTTP/WS、PTY、mock、日志、CLI |
-| 🔜 下一步 | 多真口、更强历史缓冲、Windows COM 桥文档、加固 |
-| 🧭 更后 | RFC2217、录制回放、轻量 Web 监视、指标导出 |
+| ✅ 基础 | 核心 hub、可信 TX、租约、TCP、HTTP/WS、PTY、mock、日志、CLI |
+| ✅ 证据 | 规范事件账本、可选哈希分段、查询/导出/事件 WS、安全回放 |
+| 🔜 下一步 | 受控工作流、设备身份/控制线、独占交接、多端口监督 |
+| 🧭 更后 | RFC2217、Windows COM 桥文档、更丰富的 Web 证据工具、指标导出 |
 
 ---
 
