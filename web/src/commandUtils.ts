@@ -54,12 +54,14 @@ export function loadQuickCommands(): QuickCommand[] {
     if (!raw) return [];
     const value: unknown = JSON.parse(raw);
     if (!Array.isArray(value)) return [];
-    return value.flatMap((item): QuickCommand[] => {
+    const commands = value.flatMap((item): QuickCommand[] => {
       if (!item || typeof item !== "object") return [];
       const record = item as Record<string, unknown>;
       if (
         typeof record.id !== "string" ||
+        !record.id.trim() ||
         typeof record.name !== "string" ||
+        !record.name.trim() ||
         typeof record.payload !== "string" ||
         !isCommandMode(record.mode) ||
         !isLineEnding(record.lineEnding)
@@ -76,6 +78,7 @@ export function loadQuickCommands(): QuickCommand[] {
         },
       ];
     });
+    return commands.slice(0, 200);
   } catch {
     return [];
   }
@@ -88,7 +91,7 @@ export function loadConnectionProfiles(): ConnectionProfile[] {
     if (!raw) return [];
     const value: unknown = JSON.parse(raw);
     if (!Array.isArray(value)) return [];
-    return value.flatMap((item): ConnectionProfile[] => {
+    const profiles = value.flatMap((item): ConnectionProfile[] => {
       if (!item || typeof item !== "object") return [];
       const record = item as Record<string, unknown>;
       if (
@@ -105,6 +108,7 @@ export function loadConnectionProfiles(): ConnectionProfile[] {
       }
       return [{ id: record.id, name: record.name, host: record.host, port: Number(record.port) }];
     });
+    return profiles.slice(0, 50);
   } catch {
     return [];
   }

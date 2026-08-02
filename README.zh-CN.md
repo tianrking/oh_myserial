@@ -266,6 +266,9 @@ cargo test
 ./target/release/ohmyserial --help
 ```
 
+完整的发布前测试矩阵、跨平台检查命令以及真实串口硬件在环边界见
+[`RELIABILITY_TEST_MATRIX.md`](./RELIABILITY_TEST_MATRIX.md)。
+
 ---
 
 ## 快速开始（最省事）

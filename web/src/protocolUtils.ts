@@ -258,6 +258,11 @@ function modbusLength(bytes: Uint8Array): number | null {
   return null;
 }
 
+function isKnownModbusFunction(functionCode: number): boolean {
+  return (functionCode >= 1 && functionCode <= 16) ||
+    (functionCode >= 0x81 && functionCode <= 0x90);
+}
+
 /** Parse common Modbus RTU request/response shapes and verify CRC-16. */
 export function parseModbusRtu(
   buffer: Uint8Array,
@@ -266,6 +271,12 @@ export function parseModbusRtu(
   let bytes = concatBytes(buffer, incoming);
   const frames: ProtocolFrame[] = [];
   while (bytes.length >= 5) {
+    // A Modbus RTU stream has no start marker. Discard impossible prefixes so
+    // one noisy byte cannot pin the analyzer forever before a valid frame.
+    if (bytes[0] > 247 || !isKnownModbusFunction(bytes[1])) {
+      bytes = bytes.subarray(1);
+      continue;
+    }
     const length = modbusLength(bytes);
     if (length === null || bytes.length < length) break;
     const frame = bytes.subarray(0, length).slice();

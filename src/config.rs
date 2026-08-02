@@ -648,6 +648,17 @@ impl Config {
     /// Expand `[fanout]` into concrete `[[clients]]` entries (idempotent names).
     pub fn expand_fanout(&mut self) -> anyhow::Result<()> {
         let f = self.fanout.clone();
+        if f.tcp_count > 0 {
+            let max_offset = u32::from(u16::MAX) - u32::from(f.tcp_base_port);
+            if f.tcp_count - 1 > max_offset {
+                anyhow::bail!(
+                    "fanout.tcp_count={} overflows tcp_base_port={} (maximum count is {})",
+                    f.tcp_count,
+                    f.tcp_base_port,
+                    max_offset + 1
+                );
+            }
+        }
         #[cfg(unix)]
         let existing: std::collections::HashSet<String> =
             self.clients.iter().map(|c| c.name().to_string()).collect();
@@ -685,9 +696,11 @@ impl Config {
             if self.clients.iter().any(|c| c.name() == name) {
                 continue;
             }
+            let offset = u16::try_from(i)
+                .map_err(|_| anyhow::anyhow!("tcp_count offset {i} does not fit in a TCP port"))?;
             let port = f
                 .tcp_base_port
-                .checked_add(i as u16)
+                .checked_add(offset)
                 .ok_or_else(|| anyhow::anyhow!("tcp_base_port overflow"))?;
             let bind = format!("{}:{}", f.tcp_host, port);
             self.clients.push(ClientConfig::Tcp {
@@ -824,6 +837,10 @@ impl Config {
         if self.real.path.trim().is_empty() && self.real.usb.is_none() {
             anyhow::bail!("real.path must be set unless real.usb selector is configured");
         }
+        self.real
+            .serial_settings()
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid real serial settings: {error}"))?;
         if self.api.can_control && !self.api.can_write {
             anyhow::bail!("api.can_control requires api.can_write so a lease can be acquired");
         }
@@ -1150,6 +1167,37 @@ mod tests {
     }
 
     #[test]
+    fn serial_settings_are_rejected_before_startup() {
+        let mut cfg = Config::default();
+        cfg.real.baud = 0;
+        assert!(cfg.validate().unwrap_err().to_string().contains("baud"));
+
+        cfg.real.baud = 115_200;
+        cfg.real.databits = 9;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("data bits"));
+
+        cfg.real.databits = 8;
+        cfg.real.stopbits = 3;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("stop bits"));
+
+        cfg.real.stopbits = 1;
+        cfg.real.parity = "mark".into();
+        assert!(cfg.validate().unwrap_err().to_string().contains("parity"));
+
+        cfg.real.parity = "none".into();
+        cfg.real.flow = "dsr".into();
+        assert!(cfg.validate().unwrap_err().to_string().contains("flow"));
+    }
+
+    #[test]
     fn usb_selector_requires_exact_nonzero_identity() {
         let mut cfg = Config::default();
         cfg.real.path.clear();
@@ -1291,6 +1339,20 @@ tcp_name_prefix = "m"
         assert!(eps
             .iter()
             .any(|e| e.kind == "tcp" && e.address.contains("19001")));
+    }
+
+    #[test]
+    fn fanout_rejects_tcp_port_range_overflow_before_looping() {
+        let mut cfg = Config::default();
+        cfg.clients.clear();
+        cfg.fanout.tcp_base_port = u16::MAX;
+        cfg.fanout.tcp_count = 2;
+        let error = cfg.expand_fanout().unwrap_err().to_string();
+        assert!(error.contains("overflows"), "error={error}");
+
+        cfg.fanout.tcp_count = u32::MAX;
+        let error = cfg.expand_fanout().unwrap_err().to_string();
+        assert!(error.contains("overflows"), "error={error}");
     }
 
     #[test]

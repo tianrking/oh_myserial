@@ -441,4 +441,64 @@ mod tests {
             vec![IAC, SB, COM_PORT_OPTION, 102, 8, IAC, SE]
         );
     }
+
+    #[test]
+    fn telnet_decoder_handles_negotiation_and_subnegotiation_split_at_every_boundary() {
+        let input = [
+            IAC,
+            WILL,
+            COM_PORT_OPTION,
+            IAC,
+            SB,
+            COM_PORT_OPTION,
+            SIGNATURE,
+            IAC,
+            SE,
+        ];
+        for split in 1..input.len() {
+            let mut decoder = TelnetDecoder::default();
+            let mut payload = Vec::new();
+            let mut replies = Vec::new();
+            let mut subnegotiations = Vec::new();
+            decoder.feed(
+                &input[..split.min(input.len())],
+                &mut payload,
+                &mut replies,
+                &mut subnegotiations,
+            );
+            decoder.feed(
+                &input[split.min(input.len())..],
+                &mut payload,
+                &mut replies,
+                &mut subnegotiations,
+            );
+            assert!(payload.is_empty(), "split={split} payload={payload:?}");
+            assert_eq!(replies, vec![IAC, DO, COM_PORT_OPTION], "split={split}");
+            assert_eq!(
+                subnegotiations,
+                vec![vec![COM_PORT_OPTION, SIGNATURE]],
+                "split={split}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_telnet_options_are_refused_and_unknown_commands_do_not_leak_payload() {
+        assert_eq!(negotiation_reply(WILL, 99), vec![IAC, DONT, 99]);
+        assert_eq!(negotiation_reply(DO, 99), vec![IAC, WONT, 99]);
+
+        let mut decoder = TelnetDecoder::default();
+        let mut payload = Vec::new();
+        let mut replies = Vec::new();
+        let mut subnegotiations = Vec::new();
+        decoder.feed(
+            &[IAC, 123, b'x', b'y', IAC, IAC, b'z'],
+            &mut payload,
+            &mut replies,
+            &mut subnegotiations,
+        );
+        assert_eq!(payload, b"xy\xffz");
+        assert!(replies.is_empty());
+        assert!(subnegotiations.is_empty());
+    }
 }

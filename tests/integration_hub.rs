@@ -224,6 +224,55 @@ async fn http_hex_is_one_atomic_write_without_a_delimiter() {
 }
 
 #[tokio::test]
+async fn empty_hex_write_is_rejected_before_touching_the_device() {
+    let api_port = free_port().await;
+    let tcp_port = free_port().await;
+    let cfg = test_config(api_port, tcp_port);
+    let handle = hub::run_hub(cfg).await.unwrap();
+    let mut tcp = TcpStream::connect(format!("127.0.0.1:{tcp_port}"))
+        .await
+        .unwrap();
+
+    let response = http_post_json(
+        &format!("http://127.0.0.1:{api_port}/v1/write"),
+        r#"{"hex":""}"#,
+    )
+    .await;
+    assert!(
+        response.contains("payload must not be empty"),
+        "response={response}"
+    );
+    let mut byte = [0_u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), tcp.read(&mut byte))
+            .await
+            .is_err(),
+        "an empty API write must not produce a loopback frame"
+    );
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn embedded_console_and_static_assets_are_served_by_the_api() {
+    let api_port = free_port().await;
+    let tcp_port = free_port().await;
+    let cfg = test_config(api_port, tcp_port);
+    let handle = hub::run_hub(cfg).await.unwrap();
+
+    let index = http_get(&format!("http://127.0.0.1:{api_port}/")).await;
+    assert!(index.contains("<div id=\"root\"></div>"), "index={index}");
+    let asset = index
+        .split("src=\"/")
+        .nth(1)
+        .and_then(|value| value.split('"').next())
+        .expect("embedded script asset");
+    let script = http_get(&format!("http://127.0.0.1:{api_port}/{asset}")).await;
+    assert!(script.contains("ohmyserial") || script.contains("useState"));
+
+    handle.shutdown();
+}
+
+#[tokio::test]
 async fn hub_start_fails_when_api_bind_is_occupied() {
     let api_port = free_port().await;
     let tcp_port = free_port().await;

@@ -102,7 +102,8 @@ function downloadTextFile(filename: string, content: string, mime = "text/plain;
   anchor.href = url;
   anchor.download = filename;
   anchor.click();
-  URL.revokeObjectURL(url);
+  // Let the browser enqueue the download before releasing the object URL.
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 export default function App() {
@@ -413,7 +414,12 @@ export default function App() {
       port: Number(portInput) || 8787,
     };
     setConn(cfg);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
+    } catch {
+      // Private browsing or a restrictive embed may deny storage; the active
+      // connection remains usable in memory.
+    }
     setError(null);
     setBusy(true);
     try {

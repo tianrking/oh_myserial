@@ -281,6 +281,9 @@ cargo test
 ./target/release/ohmyserial share mock:demo --ui
 ```
 
+The complete release gate and hardware-in-the-loop boundary are documented in
+[`RELIABILITY_TEST_MATRIX.md`](./RELIABILITY_TEST_MATRIX.md).
+
 ### CI matrix
 
 GitHub Actions builds & tests on:

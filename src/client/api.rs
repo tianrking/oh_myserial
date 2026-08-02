@@ -966,6 +966,15 @@ async fn write(State(st): State<Arc<ApiState>>, Json(body): Json<WriteBody>) -> 
         .into_response();
     };
 
+    if data.is_empty() {
+        return Json(WriteResp {
+            ok: false,
+            error: Some("payload must not be empty".into()),
+            bytes: 0,
+        })
+        .into_response();
+    }
+
     let who = body.as_client.as_deref().unwrap_or(&st.default_writer);
     let n = data.len();
     match st
@@ -1405,7 +1414,24 @@ async fn send_ws_error(
 }
 
 fn parse_hex(s: &str) -> Result<Vec<u8>, String> {
-    let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut clean = String::with_capacity(s.len());
+    let mut characters = s.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character.is_whitespace() {
+            continue;
+        }
+        if matches!(character, ',' | ';' | ':' | '_' | '-') {
+            continue;
+        }
+        if character == '0' && matches!(characters.peek(), Some('x' | 'X')) {
+            characters.next();
+            continue;
+        }
+        if !character.is_ascii_hexdigit() {
+            return Err("hex input must contain only ASCII hexadecimal digits".into());
+        }
+        clean.push(character);
+    }
     if !clean.len().is_multiple_of(2) {
         return Err("hex length must be even".into());
     }
@@ -1454,6 +1480,16 @@ mod tests {
 
         headers.insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("bearer"));
         assert_eq!(websocket_protocol_bearer(&headers), None);
+    }
+
+    #[test]
+    fn hex_parser_accepts_ascii_separators_and_rejects_unicode_without_panicking() {
+        assert_eq!(parse_hex("00 01,0x02:ff").unwrap(), [0, 1, 2, 255]);
+        assert_eq!(parse_hex("\t0a\n0B").unwrap(), [0x0a, 0x0b]);
+        assert!(parse_hex("abc").unwrap_err().contains("even"));
+        assert!(parse_hex("gg").unwrap_err().contains("ASCII hexadecimal"));
+        assert!(parse_hex("éé").is_err());
+        assert!(parse_hex("😀😀").is_err());
     }
 
     #[test]
