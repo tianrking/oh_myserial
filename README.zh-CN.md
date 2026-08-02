@@ -372,6 +372,8 @@ bind = "127.0.0.1:8787"
 enabled = true
 can_read = true
 can_write = true
+# 物理 DTR/RTS/BREAK 控制；每次请求仍必须带写租约
+can_control = false
 # token_env = "OHMYSERIAL_API_TOKEN"
 # cors_origins = ["https://serial-console.example.com"]
 
@@ -464,6 +466,7 @@ RUST_LOG=debug ohmyserial run -c ohmyserial.toml
 | `GET` | `/v1/events/export` | 规范事件 NDJSON 导出 |
 | `POST` | `/v1/workflows/run` | 有界线性 lease/send/expect 工作流 |
 | `POST` | `/v1/write` | 向设备发送 text 或 hex |
+| `POST` | `/v1/control` | DTR/RTS/BREAK；需要 `can_control` 与租约 token |
 | `POST` | `/v1/lock` | 申请写锁 |
 | `DELETE` | `/v1/lock` | 释放写锁 |
 | `WS` | `/v1/stream` | 实时 RX |

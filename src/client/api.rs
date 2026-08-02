@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::broker::{Broker, WriteLockView};
+use crate::broker::{Broker, ControlCommand, WriteLockView};
 use crate::client::static_ui::{static_handler, ui_embedded};
 use crate::ledger::{EventFilter, EventQuery, EventType, QueryPage};
 use crate::workflow::{
@@ -43,6 +43,7 @@ pub struct ApiState {
     pub cors_origins: Vec<String>,
     pub can_read: bool,
     pub can_write: bool,
+    pub can_control: bool,
     pub ws_can_read: bool,
     pub ws_can_write: bool,
 }
@@ -136,6 +137,7 @@ pub async fn spawn_api_server_owned(
         .route("/v1/events/export", get(events_export))
         .route("/v1/events/stream", get(events_stream))
         .route("/v1/workflows/run", post(workflow_run))
+        .route("/v1/control", post(control))
         .route("/v1/write", post(write))
         .route("/v1/lock", post(lock).delete(unlock))
         // Unlimited concurrent agents/monitors share the same stream path.
@@ -774,9 +776,7 @@ async fn workflow_run(
     let authorization = WorkflowAuthorization {
         can_read: st.can_read,
         can_write: st.can_write,
-        // Physical control operations are deliberately denied by the broker
-        // adapter until they have an owner-side command/ack path.
-        can_control: false,
+        can_control: st.can_control,
         lease_token: body.lease_token,
     };
     let runtime = BrokerWorkflowRuntime::new(st.broker.clone());
@@ -914,6 +914,79 @@ async fn write(State(st): State<Arc<ApiState>>, Json(body): Json<WriteBody>) -> 
             bytes: 0,
         })
         .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlBody {
+    /// `dtr`, `rts`, or `break`.
+    op: String,
+    /// Required for DTR/RTS. Accepted as a JSON boolean only.
+    #[serde(default)]
+    level: Option<bool>,
+    /// Required for BREAK, in milliseconds (1..=1000).
+    #[serde(default)]
+    duration_ms: Option<u64>,
+    #[serde(default)]
+    as_client: Option<String>,
+    /// Opaque token returned by POST /v1/lock.
+    #[serde(default)]
+    lease_token: Option<String>,
+}
+
+async fn control(State(st): State<Arc<ApiState>>, Json(body): Json<ControlBody>) -> Response {
+    if !st.can_control {
+        return permission_denied("serial control access");
+    }
+    let command = match body.op.trim().to_ascii_lowercase().as_str() {
+        "dtr" => body
+            .level
+            .map(ControlCommand::Dtr)
+            .ok_or_else(|| "dtr requires boolean level".to_owned()),
+        "rts" => body
+            .level
+            .map(ControlCommand::Rts)
+            .ok_or_else(|| "rts requires boolean level".to_owned()),
+        "break" => body
+            .duration_ms
+            .map(|duration_ms| ControlCommand::Break { duration_ms })
+            .ok_or_else(|| "break requires duration_ms".to_owned()),
+        other => Err(format!("unknown control operation '{other}'")),
+    };
+    let command = match command {
+        Ok(command) => command,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": error })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(error) = command.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response();
+    }
+    let actor = body.as_client.as_deref().unwrap_or(&st.default_writer);
+    match st
+        .broker
+        .serial_control(actor, body.lease_token.as_deref(), command)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(error) if error.contains("lease") => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response(),
     }
 }
 

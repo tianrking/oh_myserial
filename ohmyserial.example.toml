@@ -38,6 +38,8 @@ bind = "127.0.0.1:8787"
 enabled = true
 can_read = true
 can_write = true
+# Physical DTR/RTS/BREAK control; every request still needs a write lease.
+can_control = false
 # The URL-safe secret is read only from this environment variable, never from TOML.
 # token_env = "OHMYSERIAL_API_TOKEN"
 # Empty means same-origin browser access only. List exact origins when needed;

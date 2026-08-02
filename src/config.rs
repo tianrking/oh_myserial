@@ -282,6 +282,10 @@ pub struct ApiConfig {
     /// Permit write/lease/TX access through this API listener.
     #[serde(default = "default_true")]
     pub can_write: bool,
+    /// Permit physical DTR/RTS/BREAK control through this API listener.
+    /// Control operations still require a live write lease token.
+    #[serde(default)]
+    pub can_control: bool,
 }
 
 impl Default for ApiConfig {
@@ -293,6 +297,7 @@ impl Default for ApiConfig {
             cors_origins: Vec::new(),
             can_read: true,
             can_write: true,
+            can_control: false,
         }
     }
 }
@@ -456,6 +461,7 @@ impl Config {
                 cors_origins: Vec::new(),
                 can_read: true,
                 can_write: true,
+                can_control: false,
             },
         };
         cfg.expand_fanout()?;
@@ -675,6 +681,9 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.real.path.trim().is_empty() && self.real.usb.is_none() {
             anyhow::bail!("real.path must be set unless real.usb selector is configured");
+        }
+        if self.api.can_control && !self.api.can_write {
+            anyhow::bail!("api.can_control requires api.can_write so a lease can be acquired");
         }
         if let Some(selector) = &self.real.usb {
             if self.real.path.starts_with("mock:") {
@@ -998,6 +1007,18 @@ mod tests {
         cfg.real.usb.as_mut().unwrap().vid = 0x10c4;
         cfg.real.path = "mock:test".into();
         assert!(cfg.validate().unwrap_err().to_string().contains("mock"));
+    }
+
+    #[test]
+    fn control_capability_requires_write_access_for_lease() {
+        let mut cfg = Config::default();
+        cfg.api.can_control = true;
+        cfg.api.can_write = false;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("can_control"));
     }
 
     #[test]

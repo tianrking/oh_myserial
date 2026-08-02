@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::broker::Broker;
+use crate::broker::{Broker, ControlCommand};
 use crate::ledger::{ConnectionState, EventEnvelope, EventPayload, GapScope, LedgerStatus};
 
 pub const DEFAULT_MAX_STEPS: usize = 32;
@@ -293,8 +293,8 @@ pub trait WorkflowRuntime: Send + Sync {
 
 /// Adapter for the existing broker. It exposes confirmed writes and lease
 /// acquisition while keeping opaque credentials out of workflow definitions
-/// and evidence. Device control steps remain unavailable until the serial
-/// owner has an explicit control channel.
+/// and evidence. Device control steps are translated into the serial-owner
+/// command channel and receive an explicit OS-driver acknowledgement.
 #[derive(Clone)]
 pub struct BrokerWorkflowRuntime {
     broker: Broker,
@@ -380,16 +380,49 @@ impl WorkflowRuntime for BrokerWorkflowRuntime {
 
     fn control<'a>(
         &'a self,
-        _actor: &'a str,
-        _token: Option<&'a str>,
+        actor: &'a str,
+        token: Option<&'a str>,
         name: &'a str,
-        _value: Option<&'a str>,
+        value: Option<&'a str>,
     ) -> WorkflowFuture<'a, ()> {
         Box::pin(async move {
-            Err(WorkflowError::Runtime(format!(
-                "control operation '{name}' is unavailable until the serial-owner control channel is enabled"
-            )))
+            let command = parse_control_command(name, value).map_err(WorkflowError::Runtime)?;
+            self.broker
+                .serial_control(actor, token, command)
+                .await
+                .map_err(WorkflowError::Runtime)
         })
+    }
+}
+
+fn parse_control_command(name: &str, value: Option<&str>) -> Result<ControlCommand, String> {
+    let name = name.trim().to_ascii_lowercase();
+    match name.as_str() {
+        "dtr" => parse_level(value, "dtr").map(ControlCommand::Dtr),
+        "rts" => parse_level(value, "rts").map(ControlCommand::Rts),
+        "break" => {
+            let raw = value.ok_or_else(|| "break control requires duration_ms".to_owned())?;
+            let raw = raw.strip_prefix("duration_ms=").unwrap_or(raw).trim();
+            let duration_ms = raw
+                .parse::<u64>()
+                .map_err(|_| "break duration_ms must be an integer".to_owned())?;
+            let command = ControlCommand::Break { duration_ms };
+            command.validate()?;
+            Ok(command)
+        }
+        _ => Err(format!(
+            "unknown control operation '{name}'; expected dtr, rts, or break"
+        )),
+    }
+}
+
+fn parse_level(value: Option<&str>, name: &str) -> Result<bool, String> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("on" | "true" | "1" | "high") => Ok(true),
+        Some("off" | "false" | "0" | "low") => Ok(false),
+        _ => Err(format!(
+            "{name} control requires value on/off (or true/false)"
+        )),
     }
 }
 

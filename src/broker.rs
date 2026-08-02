@@ -60,6 +60,50 @@ pub struct PortStatus {
     pub detail: String,
 }
 
+/// A physical serial control-line operation. These commands are deliberately
+/// separate from byte TX: the serial-owner thread is the only code allowed to
+/// touch the OS handle, and every command receives an explicit acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlCommand {
+    Dtr(bool),
+    Rts(bool),
+    Break { duration_ms: u64 },
+}
+
+impl ControlCommand {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Self::Break { duration_ms } = self {
+            if !(1..=1_000).contains(duration_ms) {
+                return Err("break duration_ms must be between 1 and 1000".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn audit_name(&self) -> &'static str {
+        match self {
+            Self::Dtr(_) => "dtr",
+            Self::Rts(_) => "rts",
+            Self::Break { .. } => "break",
+        }
+    }
+
+    fn audit_value(&self) -> String {
+        match self {
+            Self::Dtr(level) | Self::Rts(level) => level.to_string(),
+            Self::Break { duration_ms } => format!("duration_ms={duration_ms}"),
+        }
+    }
+}
+
+/// Internal command envelope handed to the blocking serial owner.
+pub enum SerialControl {
+    Command {
+        command: ControlCommand,
+        acknowledgement: oneshot::Sender<Result<(), String>>,
+    },
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StatusSnapshot {
     pub port: PortStatusView,
@@ -353,6 +397,8 @@ pub struct Broker {
     log: SessionLog,
     /// Notify waiters when serial connection state changes.
     port_watch: watch::Sender<PortStatus>,
+    /// Sender for control-line commands consumed only by the serial owner.
+    serial_control: Arc<Mutex<Option<mpsc::Sender<SerialControl>>>>,
 }
 
 pub struct ClientRegistration {
@@ -441,6 +487,7 @@ impl Broker {
                 ledger,
                 log,
                 port_watch,
+                serial_control: Arc::new(Mutex::new(None)),
             },
             serial_tx_rx,
             port_watch_rx,
@@ -453,6 +500,98 @@ impl Broker {
 
     pub fn ledger(&self) -> Ledger {
         self.ledger.clone()
+    }
+
+    /// Attach the command channel after all broker state has been created. The
+    /// serial owner calls this before it opens a real device, so no control
+    /// command can bypass the single-handle ownership boundary.
+    pub fn attach_serial_control(&self, sender: mpsc::Sender<SerialControl>) {
+        *self.serial_control.lock() = Some(sender);
+    }
+
+    /// Remove the owner channel during shutdown. Pending callers receive a
+    /// deterministic error instead of waiting for a detached worker.
+    pub fn detach_serial_control(&self) {
+        *self.serial_control.lock() = None;
+    }
+
+    /// Execute one physical control-line operation under a live write lease.
+    /// The lease is intentionally required even when TX mode is not exclusive:
+    /// toggling DTR/RTS or asserting BREAK can reset or disrupt hardware.
+    pub async fn serial_control(
+        &self,
+        actor: &str,
+        lease_token: Option<&str>,
+        command: ControlCommand,
+    ) -> Result<(), String> {
+        Self::validate_actor_label(actor)?;
+        command.validate()?;
+        let now = Instant::now();
+        let (sender, connection_epoch, timeout) = {
+            let g = self.state.lock();
+            if !g.port.connected {
+                return Err("serial port is disconnected; control was not queued".into());
+            }
+            let Some(token) = lease_token else {
+                return Err("control requires an active write lease token".into());
+            };
+            if !g
+                .lock
+                .as_ref()
+                .is_some_and(|lock| lock.authorizes(Some(token), now))
+            {
+                return Err("control lease expired, was released, or was replaced".into());
+            }
+            let Some(sender) = self.serial_control.lock().clone() else {
+                return Err("serial owner control channel is unavailable".into());
+            };
+            (
+                sender,
+                g.connection_epoch,
+                Duration::from_millis(g.policy.write_timeout_ms.max(1)),
+            )
+        };
+
+        let (acknowledgement, result) = oneshot::channel();
+        let envelope = SerialControl::Command {
+            command: command.clone(),
+            acknowledgement,
+        };
+        let result = match tokio::time::timeout(timeout, sender.send(envelope)).await {
+            Ok(Ok(())) => match tokio::time::timeout(timeout, result).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("serial owner dropped the control acknowledgement".into()),
+                Err(_) => Err("serial control acknowledgement timed out".into()),
+            },
+            Ok(Err(_)) => Err("serial owner control channel is closed".into()),
+            Err(_) => Err("serial control queue deadline expired".into()),
+        };
+
+        let (name, value) = (command.audit_name(), command.audit_value());
+        match result {
+            Ok(()) => {
+                let _ = self.record_event(
+                    connection_epoch,
+                    EventPayload::Control(ControlPayload {
+                        actor: Some(actor.to_owned()),
+                        name: name.to_owned(),
+                        value: Some(value),
+                    }),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.record_event(
+                    connection_epoch,
+                    EventPayload::Control(ControlPayload {
+                        actor: Some(actor.to_owned()),
+                        name: format!("{name}_rejected"),
+                        value: Some(error.clone()),
+                    }),
+                );
+                Err(error)
+            }
+        }
     }
 
     pub fn record_control(
@@ -1365,7 +1504,7 @@ pub type Done = oneshot::Sender<()>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::{EventPayload, EventQuery, GapScope};
+    use crate::ledger::{EventFilter, EventPayload, EventQuery, GapScope};
     use crate::policy::Policy;
     use crate::policy::{SlowClientPolicy, TxMode};
 
@@ -1555,6 +1694,50 @@ mod tests {
         assert_eq!(renewed.lease_token, lease.lease_token);
         broker.release_lock(Some(&lease.lease_token)).unwrap();
         assert!(broker.snapshot().lock_owner.is_none());
+    }
+
+    #[tokio::test]
+    async fn control_requires_lease_and_waits_for_owner_ack() {
+        let (broker, _serial_rx) = test_broker(TxMode::QueueByLine);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        broker.attach_serial_control(control_tx);
+        let no_lease = broker
+            .serial_control("agent", None, ControlCommand::Dtr(true))
+            .await
+            .unwrap_err();
+        assert!(no_lease.contains("lease"));
+
+        let lease = broker.acquire_lock("agent").unwrap();
+        let operation = {
+            let broker = broker.clone();
+            let token = lease.lease_token.clone();
+            tokio::spawn(async move {
+                broker
+                    .serial_control("agent", Some(&token), ControlCommand::Dtr(true))
+                    .await
+            })
+        };
+        let SerialControl::Command {
+            command,
+            acknowledgement,
+        } = control_rx.recv().await.expect("owner command");
+        assert_eq!(command, ControlCommand::Dtr(true));
+        acknowledgement.send(Ok(())).unwrap();
+        operation.await.unwrap().unwrap();
+
+        let page = broker.ledger().query(EventQuery {
+            after_seq: 0,
+            through_seq: None,
+            limit: 100,
+            filter: EventFilter::default(),
+        });
+        assert!(page.events.iter().any(|event| {
+            matches!(
+                &event.event,
+                EventPayload::Control(payload)
+                    if payload.actor.as_deref() == Some("agent") && payload.name == "dtr"
+            )
+        }));
     }
 
     #[tokio::test]

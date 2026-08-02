@@ -227,6 +227,7 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
             cors_origins: cfg.api.cors_origins.clone(),
             can_read: cfg.api.can_read,
             can_write: cfg.api.can_write,
+            can_control: cfg.api.can_control,
             ws_can_read,
             ws_can_write,
         };
@@ -272,6 +273,7 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
                             cors_origins: cfg.api.cors_origins.clone(),
                             can_read: *can_read,
                             can_write: *can_write,
+                            can_control: cfg.api.can_control,
                             ws_can_read: *can_read,
                             ws_can_write: *can_write,
                         };

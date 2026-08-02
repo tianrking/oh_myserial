@@ -60,8 +60,11 @@ broker's confirmed host-write path once; the runner never silently retries it.
 across arbitrary read chunks. `client_delivery` gaps do not fail the matcher,
 but RX observation gaps, cursor eviction/lag, disconnects, and connection-epoch
 changes fail closed. `assert` supports only the explicit `port_connected` and
-`connection_epoch` forms. `control` is schema-reserved but currently returns a
-clear unavailable error until the serial-owner control channel is implemented.
+`connection_epoch` forms. `control` accepts `dtr`, `rts`, and `break` with a
+string value (`on`/`off` or a break duration in milliseconds). It requires the
+API's `can_control` capability and a valid lease, then waits for the
+serial-owner acknowledgement. RTS is rejected while hardware flow control is
+active; mock mode reports that physical lines are unavailable.
 
 The result includes a server-generated actor, final evidence cursor
 (`session_id`, `port_id`, `connection_epoch`, `seq`, `byte_offset`), and bounded

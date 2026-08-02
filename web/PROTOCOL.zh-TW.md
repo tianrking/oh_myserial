@@ -232,7 +232,18 @@ API Bearer 用於存取 hub；下文的 `lease_token` 用於獨占 TX，兩者�
 
 ---
 
-### 3.7 `POST /v1/lock`
+### 3.7 `POST /v1/control`
+
+控制線操作需要 API 的 `can_control = true`，且必須攜帶有效的
+`lease_token`。`dtr` / `rts` 使用布林 `level`；`break` 使用
+`duration_ms`（1 到 1000）。命令由唯一的 serial owner 執行並等待 OS
+驅動回覆；mock 模式會明確拒絕物理控制線，硬體 flow control 啟用時也拒絕 RTS。
+
+```json
+{ "op": "dtr", "level": true, "lease_token": "opaque-token" }
+```
+
+### 3.8 `POST /v1/lock`
 
 **用途**：申請寫鎖租約。
 
@@ -265,7 +276,7 @@ API Bearer 用於存取 hub；下文的 `lease_token` 用於獨占 TX，兩者�
 
 ---
 
-### 3.8 `DELETE /v1/lock`
+### 3.9 `DELETE /v1/lock`
 
 **用途**：釋放寫鎖。存在有效租約時必須提交它的 token：
 

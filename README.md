@@ -443,6 +443,8 @@ bind = "127.0.0.1:8787"
 enabled = true
 can_read = true
 can_write = true
+# Physical DTR/RTS/BREAK control; every request still needs a write lease.
+can_control = false
 # token_env = "OHMYSERIAL_API_TOKEN"
 # cors_origins = ["https://serial-console.example.com"]
 
@@ -530,6 +532,7 @@ Browser access is same-origin by default. Requests must also carry a Host author
 | `GET` | `/v1/events/export` | Canonical event NDJSON export |
 | `POST` | `/v1/workflows/run` | Bounded linear lease/send/expect workflow |
 | `POST` | `/v1/write` | Send text or hex to device |
+| `POST` | `/v1/control` | DTR/RTS/BREAK; requires `can_control` and a lease token |
 | `POST` | `/v1/lock` | Acquire write lock |
 | `DELETE` | `/v1/lock` | Release write lock |
 | `WS` | `/v1/stream` | Live RX stream |
@@ -552,6 +555,13 @@ curl -s -X POST http://127.0.0.1:8787/v1/write \
 HTTP text and hex writes are one atomic command, independent of delimiter framing. `ok: true` means the serial-owner thread completed the host-side `write_all` and `flush`; it does **not** mean the device parsed or acknowledged the command. Queue admission and that acknowledgement share the `tx.write_timeout_ms` deadline. If an error says the outcome may be partial or unknown, do not blindly retry—the driver may have written some or all bytes before reporting failure or timing out.
 
 When a write lease is active, include its `lease_token` in the request. Acquire it with `POST /v1/lock`, renew it by posting the token to the same route, and release it with `DELETE /v1/lock`. The token is returned only on acquire/renew and is never included in status output.
+
+Physical control lines are opt-in with `api.can_control = true`. Call
+`POST /v1/control` with `{ "op": "dtr", "level": true, "lease_token": "…" }`,
+`rts`, or `{ "op": "break", "duration_ms": 25, "lease_token": "…" }`.
+The serial-owner thread performs the OS operation and acknowledges it; mock
+mode rejects these operations because it has no physical lines. RTS is rejected
+when `real.flow = "hardware"` to avoid fighting the driver's flow-control state.
 
 ### WebSocket
 

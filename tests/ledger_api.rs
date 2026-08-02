@@ -50,6 +50,7 @@ struct ApiAccess {
     cors_origins: Vec<String>,
     can_read: bool,
     can_write: bool,
+    can_control: bool,
     ws_can_read: bool,
     ws_can_write: bool,
 }
@@ -61,6 +62,7 @@ impl Default for ApiAccess {
             cors_origins: vec![ALLOWED_ORIGIN.to_owned()],
             can_read: true,
             can_write: true,
+            can_control: false,
             ws_can_read: true,
             ws_can_write: true,
         }
@@ -132,6 +134,7 @@ async fn start_server(ledger: Ledger, access: ApiAccess) -> TestServer {
             cors_origins: access.cors_origins,
             can_read: access.can_read,
             can_write: access.can_write,
+            can_control: access.can_control,
             ws_can_read: access.ws_can_read,
             ws_can_write: access.ws_can_write,
         },

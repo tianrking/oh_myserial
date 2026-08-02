@@ -9,7 +9,7 @@ use parking_lot::{Condvar, Mutex};
 use serialport::{DataBits, FlowControl, Parity, SerialPortType, StopBits};
 use tokio::sync::mpsc;
 
-use crate::broker::{Broker, DeviceWrite, PortStatus};
+use crate::broker::{Broker, ControlCommand, DeviceWrite, PortStatus, SerialControl};
 use crate::config::RealPortConfig;
 
 pub struct SerialHub {
@@ -65,13 +65,15 @@ impl SerialHub {
         let stop_r = stop.clone();
         let cfg_r = cfg.clone();
         let broker_r = broker.clone();
+        let (control_tx, control_rx) = mpsc::channel(32);
+        broker.attach_serial_control(control_tx);
 
         // The blocking IO thread owns both the serial port and the bounded Tokio
         // receiver. Keeping the original bounded queue all the way to the device
         // prevents an async-to-std bridge from silently becoming unbounded.
         let join = std::thread::Builder::new()
             .name("ohmyserial-serial".into())
-            .spawn(move || serial_thread(cfg_r, broker_r, to_device, stop_r))?;
+            .spawn(move || serial_thread(cfg_r, broker_r, to_device, control_rx, stop_r))?;
 
         Ok(Self {
             stop,
@@ -91,10 +93,11 @@ fn serial_thread(
     cfg: RealPortConfig,
     broker: Broker,
     mut write_rx: mpsc::Receiver<DeviceWrite>,
+    mut control_rx: mpsc::Receiver<SerialControl>,
     stop: Arc<StopSignal>,
 ) {
     if cfg.path.starts_with("mock:") {
-        run_mock(&cfg, &broker, &mut write_rx, stop);
+        run_mock(&cfg, &broker, &mut write_rx, &mut control_rx, stop);
         return;
     }
 
@@ -108,6 +111,7 @@ fn serial_thread(
         // against a newly opened device. This is especially important for boot,
         // reset and firmware-update commands.
         drop_pending_writes(&broker, &mut write_rx, "serial_disconnected");
+        drop_pending_controls(&mut control_rx, "serial_disconnected");
 
         match open_port(&cfg) {
             Ok((mut port, resolved_path)) => {
@@ -126,7 +130,9 @@ fn serial_thread(
                     &mut *port,
                     &broker,
                     &mut write_rx,
+                    &mut control_rx,
                     &stop,
+                    &cfg.flow,
                     cfg.read_timeout_ms,
                 ) {
                     break; // shutdown
@@ -168,13 +174,17 @@ fn serial_thread(
         detail: "stopped".into(),
     });
     close_pending_writes(&broker, &mut write_rx, "serial_stopped");
+    drop_pending_controls(&mut control_rx, "serial_stopped");
+    broker.detach_serial_control();
 }
 
 fn io_loop(
     port: &mut dyn serialport::SerialPort,
     broker: &Broker,
     write_rx: &mut mpsc::Receiver<DeviceWrite>,
+    control_rx: &mut mpsc::Receiver<SerialControl>,
     stop: &StopSignal,
+    flow: &str,
     read_timeout_ms: u64,
 ) -> bool {
     const MAX_WRITE_BURST: usize = 32;
@@ -183,6 +193,12 @@ fn io_loop(
     loop {
         if stop.is_requested() {
             return false;
+        }
+
+        while let Ok(control) = control_rx.try_recv() {
+            if !apply_control(port, control, stop, flow) {
+                return false;
+            }
         }
 
         // Bound each TX burst so a busy writer cannot starve device RX.
@@ -324,11 +340,58 @@ fn read_poll_timeout(configured_ms: u64) -> Duration {
     Duration::from_millis(configured_ms.max(10)).min(MAX_READ_POLL_TIMEOUT)
 }
 
+fn apply_control(
+    port: &mut dyn serialport::SerialPort,
+    control: SerialControl,
+    stop: &StopSignal,
+    flow: &str,
+) -> bool {
+    let SerialControl::Command {
+        command,
+        acknowledgement,
+    } = control;
+    let result = match command {
+        ControlCommand::Dtr(level) => port
+            .write_data_terminal_ready(level)
+            .map_err(|error| format!("DTR operation failed: {error}")),
+        ControlCommand::Rts(level) => {
+            if flow.eq_ignore_ascii_case("hardware") {
+                Err("RTS control is unavailable while hardware flow control is active".into())
+            } else {
+                port.write_request_to_send(level)
+                    .map_err(|error| format!("RTS operation failed: {error}"))
+            }
+        }
+        ControlCommand::Break { duration_ms } => {
+            let result = port
+                .set_break()
+                .map_err(|error| format!("BREAK assertion failed: {error}"));
+            if result.is_ok() {
+                let interrupted = stop.wait_timeout(Duration::from_millis(duration_ms));
+                let clear = port
+                    .clear_break()
+                    .map_err(|error| format!("BREAK clear failed: {error}"));
+                if interrupted {
+                    Err("serial owner stopped during BREAK".into())
+                } else {
+                    clear
+                }
+            } else {
+                result
+            }
+        }
+    };
+    let stopping = stop.is_requested();
+    let _ = acknowledgement.send(result);
+    !stopping
+}
+
 /// Mock serial: pairs TX back as RX (loopback) and accepts inject via optional channel later.
 fn run_mock(
     cfg: &RealPortConfig,
     broker: &Broker,
     write_rx: &mut mpsc::Receiver<DeviceWrite>,
+    control_rx: &mut mpsc::Receiver<SerialControl>,
     stop: Arc<StopSignal>,
 ) {
     broker.set_port_status(PortStatus {
@@ -343,6 +406,14 @@ fn run_mock(
 
     // Optional inject path: mock:name listens on a side channel via global? Keep simple loopback.
     while !stop.is_requested() {
+        while let Ok(SerialControl::Command {
+            acknowledgement, ..
+        }) = control_rx.try_recv()
+        {
+            let _ = acknowledgement.send(Err(
+                "physical serial control lines are unavailable in mock mode".into(),
+            ));
+        }
         match write_rx.try_recv() {
             Ok(write) => {
                 if let Err(reason) = broker.validate_device_write(&write) {
@@ -370,6 +441,8 @@ fn run_mock(
         detail: "mock closed".into(),
     });
     close_pending_writes(broker, write_rx, "serial_stopped");
+    drop_pending_controls(control_rx, "serial_stopped");
+    broker.detach_serial_control();
 }
 
 impl Drop for SerialHub {
@@ -391,6 +464,15 @@ fn drop_pending_writes(broker: &Broker, write_rx: &mut mpsc::Receiver<DeviceWrit
             "tx_gap reason={reason} chunks={chunks} bytes={bytes}"
         ));
         tracing::warn!(chunks, bytes, reason, "discarded stale serial writes");
+    }
+}
+
+fn drop_pending_controls(control_rx: &mut mpsc::Receiver<SerialControl>, reason: &str) {
+    while let Ok(SerialControl::Command {
+        acknowledgement, ..
+    }) = control_rx.try_recv()
+    {
+        let _ = acknowledgement.send(Err(format!("serial control was not attempted: {reason}")));
     }
 }
 

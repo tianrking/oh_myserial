@@ -14,7 +14,12 @@ All notable changes to this project are documented in this file.
 
 - Added a finite linear workflow DSL with lease, atomic send, incremental RX expect, explicit assertions, waits, and reserved control steps.
 - Added server-generated workflow actors, idempotent `request_id` handling, bounded evidence cursors, cancellation, and fail-closed behavior for RX gaps, lag, disconnects, and epoch changes.
-- Added `POST /v1/workflows/run`; physical serial control-line operations remain unavailable until the owner-side command channel is implemented.
+- Added `POST /v1/workflows/run`; control steps now use the serial-owner command channel for acknowledged DTR/RTS/BREAK operations.
+
+### Serial control lines
+
+- Added a bounded owner-thread command channel and `POST /v1/control` for DTR, RTS, and BREAK.
+- Control operations require the explicit `api.can_control` capability plus an opaque write lease; RTS is guarded against hardware-flow-control conflicts and mock mode makes no physical claim.
 
 ### Event ledger and safe replay
 
