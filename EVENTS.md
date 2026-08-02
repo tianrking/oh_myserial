@@ -76,7 +76,7 @@ Each event is one JSON object:
 | `seq` | Session-scoped canonical sequence, starting at 1 and increasing by one. |
 | `ts_utc` | RFC 3339 UTC observation timestamp with microsecond precision. |
 | `mono_us` | Microseconds since this ledger process started; useful for durations and replay pacing. |
-| `port_id` | `default` in v1. The field reserves a stable identity slot for later multi-port support. |
+| `port_id` | `default` for the hub session in v1. `supervise` keeps profiles in independent hub sessions/ledgers, so their byte streams and sequence spaces are not merged. |
 | `connection_epoch` | Serial connection generation. A successful disconnected-to-connected transition increments it. |
 | `type` | `rx`, `tx`, `connection`, `control`, or `gap`. |
 | `payload` | Type-specific object described below. |

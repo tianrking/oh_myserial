@@ -21,7 +21,7 @@ React 控制台（`web/`）與 AI Agent 皆應遵守此規格。
 
 | 通道 | 用途 |
 |------|------|
-| HTTP | 健康檢查、狀態、端點清單、寫入、寫鎖 |
+| HTTP | 健康檢查、狀態、端點清單、事件查詢、寫入、控制線、交接、寫鎖 |
 | WebSocket | 即時 RX 串流；亦可 TX 文字/二進位 |
 | TCP / PTY | 給傳統工具（不在本網頁協定內，見 hub 設定） |
 
@@ -98,6 +98,7 @@ API Bearer 用於存取 hub；下文的 `lease_token` 用於獨占 TX，兩者�
 | `port.connected` | 是否已開啟 |
 | `port.epoch` | 連線世代；每次斷線後重新連線會遞增 |
 | `port.detail` | 狀態說明 |
+| `handoff` | 目前是否在外部維護交接窗口；active 時含 path / expires_ms |
 | `tx_mode` | 如 `queue_by_line` |
 | `lock_owner` | 寫鎖持有者或 null |
 | `lock_expires_ms` | 剩餘毫秒 |
@@ -228,7 +229,7 @@ API Bearer 用於存取 hub；下文的 `lease_token` 用於獨占 TX，兩者�
 }
 ```
 
-`request_id` 完成後重送會得到相同結果；並行重送會被拒絕，不會執行第二次寫入。服務器生成 `workflow:<uuid>` actor，租約 token 不會出現在回應或事件賬本。`expect` 在 canonical RX 分片之間增量匹配；RX observation gap、游標遺失、斷線與 epoch 變更會 fail-closed，`client_delivery` gap 不會誤判為裝置 RX 遺失。`control` 目前只保留 schema，直到 serial-owner command channel 完成前會回傳 unavailable。
+`request_id` 完成後重送會得到相同結果；並行重送會被拒絕，不會執行第二次寫入。服務器生成 `workflow:<uuid>` actor，租約 token 不會出現在回應或事件賬本。`expect` 在 canonical RX 分片之間增量匹配；RX observation gap、游標遺失、斷線與 epoch 變更會 fail-closed，`client_delivery` gap 不會誤判為裝置 RX 遺失。`control` 會透過 serial-owner command channel 執行 DTR/RTS/BREAK，仍需要 `can_control` 與有效寫租約；mock 及硬體 flow control 衝突會明確回報失敗。
 
 ---
 
@@ -311,6 +312,23 @@ TTL 到期時 owner 會自動恢復。mock 模式明確拒絕交接。
 
 ---
 
+### 3.12 事件查詢與串流
+
+事件 API 是唯讀證據面，不會把歷史 TX 回送到串口：
+
+| 方法 | 路徑 | 用途 |
+|------|------|------|
+| `GET` | `/v1/events/status` | 查詢 session、ring、持久化與恢復狀態 |
+| `GET` | `/v1/events` | 以 `after_seq` / `limit` 查詢，可按 type、epoch、actor、bytes 過濾 |
+| `GET` | `/v1/events/export` | 匯出規範 NDJSON；記憶體 ring 不足時可能回 `410` |
+| `WS` | `/v1/events/stream` | 先補快照再接續 live 的 JSON text envelope |
+
+完整 envelope、gap 語義、游標補流、持久化與安全回放見
+[`../EVENTS.md`](../EVENTS.md)。事件序號屬於單一 `session_id`；不要跨 session
+重用游標。回放只讀取並驗證封存資料，不開裝置、不取得租約，也不執行 TX。
+
+---
+
 ## 4. WebSocket 協定 `WS /v1/stream`
 
 ### 4.1 連線
@@ -362,19 +380,22 @@ WS TX 成功入隊沒有主機寫入 ACK。需要 `write_all` + `flush` 結果�
 
 ---
 
-## 5. 網頁功能對應表（React TODO / 已實作清單）
+## 5. 網頁功能對應表（React 已實作清單）
 
 | 功能 | 協定 | 網頁行為 |
 |------|------|----------|
 | 設定 hub 位址 | — | 輸入 host/port，localStorage 記住 |
+| 會話配置 | — | 儲存/載入/刪除 host/port；不儲存 Bearer Token |
 | 探活連線 | `GET /v1/health` | 顯示連線狀態燈 |
 | 埠與統計 | `GET /v1/status` | 定時刷新 |
 | 並聯端點 | `GET /v1/endpoints` | 列表 + 一鍵複製 |
 | 連線客戶端 | `GET /v1/clients` 或 status | 表格 |
-| 即時日誌 | `WS /v1/stream` | 滾動日誌、暫停、清空 |
-| 送文字 | `POST /v1/write` text | 輸入框 + 可選補行 |
-| 送 hex | `POST /v1/write` hex | hex 輸入 |
+| 即時日誌 | `WS /v1/stream` | 滾動日誌、暫停、自動捲動、時間戳、文字/Hex/雙欄、匯出 |
+| 送文字 | `POST /v1/write` text | 行尾選擇、Ctrl/⌘+Enter、快捷指令、定時發送 |
+| 送 hex | `POST /v1/write` hex | Hex 輸入、SUM8/XOR8/CRC16 wire preview |
+| 協定觀察 | 本地解析，不改變 RX wire bytes | RawData、FireWater CSV、JustFloat LE、基礎波形 |
 | 寫鎖 | `POST/DELETE /v1/lock` | 按鈕 |
+| 控制線 | `POST /v1/control` | DTR/RTS/BREAK；需要 `api.can_control` + 寫鎖 |
 | 協定說明 | 本文件 | 頁內「協定」分頁 |
 
 ---

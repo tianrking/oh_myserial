@@ -35,6 +35,7 @@
   Hub 的寫鎖、TX 仲裁、大小限制與 host-confirmed 回傳保護。
 - 定時送出最低 50 ms，並使用同一條寫入路徑；停止勾選後不會留下背景計時器。
 - 即時日誌可分開查看文字與 Hex、顯示/隱藏時間戳，並匯出目前頁面保留的日誌。
+- 即時日誌支援暫停、自動捲動和清空；波形解析只在瀏覽器本地進行，不改寫 RX 原始位元組。
 
 串口的 baud、data bits、parity、stop bits、flow control 仍由 `run` / `share`
 的 TOML/CLI 設定，在 Hub 重新開啟實體埠時套用；控制台顯示目前埠與 baud，避免

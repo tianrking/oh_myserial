@@ -141,14 +141,15 @@ Device (UART/COM)
 | Write-lock lease | Time-bounded TX ownership | ✅ |
 | Auto reconnect | Optional reopen after disconnect | ✅ |
 | TCP client | Raw bidirectional byte stream | ✅ |
-| HTTP API | health / status / write / lock | ✅ |
+| HTTP API | health / status / endpoints / events / workflows / write / control / handoff / lock | ✅ |
 | WebSocket stream | Live RX (+ optional history on connect) | ✅ |
 | Unix PTY | Symlinked virtual serial for classic tools | ✅ (macOS/Linux) |
 | Session log | Console + file; text / hex / hex+text | ✅ |
+| Web serial console | Profiles, line endings, quick commands, timed send, checksums, protocol parsing, waveform, control lines | ✅ |
 | Event ledger | Versioned RX/TX/connection/control/gap evidence; bounded memory + optional hashed NDJSON | ✅ |
 | Safe replay | Verified, read-only `immediate` / `original` / `manual` replay | ✅ |
 | Mock port | `mock:demo` loopback without hardware | ✅ |
-| TOML config + CLI | `run` / `init` / `list-ports` / `status` / `supervise` | ✅ |
+| TOML config + CLI | `share` / `run` / `init` / `list-ports` / `status` / `supervise` | ✅ |
 | Multi-port single process | Multiple independent real profiles with collision checks | ✅ |
 | RFC2217 | Telnet serial control over network | 🔜 |
 | Native Windows virtual COM | Kernel/driver-level COM clone | 🔜 / external bridge |
@@ -319,6 +320,12 @@ HTTP    http://127.0.0.1:8787
 | `--tcp-base P` | first TCP port | `8788` |
 | `--api ADDR` | HTTP/WS bind | `127.0.0.1:8787` |
 | `-b/--baud` | baud rate | `115200` |
+| `--data-bits N` | data bits (5/6/7/8) | `8` |
+| `--parity VALUE` | none/odd/even/mark/space | `none` |
+| `--stop-bits N` | stop bits (1/2) | `1` |
+| `--flow-control VALUE` | none/software/hardware | `none` |
+| `--quiet` | disable console session-log mirror | off |
+| `--ui` | open the embedded web console | off |
 
 ### Optional: config file
 
@@ -426,6 +433,10 @@ path = "mock:demo"          # or /dev/ttyUSB0, COM3, …
 # Optional exact USB identity (re-resolved before every open/reconnect):
 # usb = { vid = 0x10c4, pid = 0xea60, serial_number = "board-01" }
 baud = 115200
+databits = 8
+parity = "none"
+stopbits = 1
+flow = "none"
 reconnect = true
 
 [tx]
@@ -488,6 +499,7 @@ format = "hex+text"
 | `api.bind` | HTTP/WS; plaintext listeners are restricted to loopback |
 | `api.token_env` | Name of the environment variable containing the API bearer secret |
 | `api.cors_origins` | Exact browser origins; empty means same-origin only, and `*` is rejected |
+| `api.can_control` | Opt-in DTR/RTS/BREAK and handoff capability; requests still need a write lease |
 | `ledger.memory_events` / `memory_bytes` | Always-on bounded event evidence ring |
 | `ledger.directory` | Optional append-only hashed NDJSON persistence root |
 | `ledger.stream_capacity` / `rotate_bytes` | Live event subscriber bound / sealed segment size target |
@@ -499,7 +511,9 @@ format = "hex+text"
 ## CLI reference
 
 ```bash
+ohmyserial share <device> [serial/endpoint flags]  # zero-config hub
 ohmyserial run -c ohmyserial.toml    # start hub
+ohmyserial supervise -c board-a.toml -c board-b.toml  # multiple real ports
 ohmyserial init [-o file]           # sample config to stdout/file
 ohmyserial list-ports               # list serial devices
 ohmyserial status [--api URL]       # GET /v1/status
@@ -710,6 +724,7 @@ oh_myserial/
 ├── WORKFLOWS.md              # Bounded linear agent workflow contract
 ├── ohmyserial.example.toml
 ├── web/                      # Optional React console (Traditional Chinese)
+│   ├── README.md             # Web console build and feature guide
 │   ├── PROTOCOL.zh-TW.md     # Full HTTP/WS protocol
 │   ├── README.zh-TW.md
 │   └── src/
@@ -735,6 +750,13 @@ cargo build --release
 | Optional CDN/Vercel | `web/vercel.json` (HTTPS→local WS may be blocked) |
 
 Protocol (zh-TW): [`web/PROTOCOL.zh-TW.md`](./web/PROTOCOL.zh-TW.md).
+
+The console currently provides browser-local Hub profiles, text/Hex writes with
+explicit line endings, quick commands, 50 ms-minimum timed sending, optional
+SUM8/XOR8/CRC16 preprocessing, text/Hex log views and export, RawData/
+FireWater/JustFloat parsing with a bounded waveform, and guarded
+DTR/RTS/BREAK controls. All writes still go through `/v1/write`; the page does
+not become a second serial owner and does not persist bearer tokens.
 
 ---
 

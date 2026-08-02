@@ -55,6 +55,7 @@
 - [Soporte de plataformas](#soporte-de-plataformas)
 - [Instalación y compilación](#instalación-y-compilación)
 - [Inicio rápido](#inicio-rápido)
+- [Consola web serie](#consola-web-serie)
 - [Cómo usarlo (escenarios)](#cómo-usarlo-escenarios)
 - [Configuración](#configuración)
 - [CLI](#cli)
@@ -138,13 +139,15 @@ Dispositivo (UART/COM)
 | Bloqueo de escritura | Propiedad temporal de TX | ✅ |
 | Reconexión | Reapertura opcional al desconectar | ✅ |
 | Cliente TCP | Flujo de bytes bidireccional | ✅ |
-| API HTTP | health / status / write / lock | ✅ |
+| API HTTP | health / status / endpoints / events / workflows / write / control / handoff / lock | ✅ |
 | WebSocket | RX en vivo (+ historial opcional) | ✅ |
 | PTY Unix | Serie virtual con symlink | ✅ (macOS/Linux) |
 | Log de sesión | Consola + archivo; text/hex | ✅ |
+| Consola web serie | Perfiles, finales de línea, comandos rápidos, temporizador, checksums, protocolos, onda y líneas de control | ✅ |
+| Event ledger y replay seguro | Evidencia RX/TX/connection/control/gap con ring acotado y replay verificado | ✅ |
 | Puerto mock | `mock:demo` sin hardware | ✅ |
-| TOML + CLI | `run` / `init` / `list-ports` / `status` | ✅ |
-| Multi-puerto en un proceso | Varios perfiles reales | 🔜 |
+| TOML + CLI | `share` / `run` / `init` / `list-ports` / `status` / `supervise` | ✅ |
+| Multi-puerto en un proceso | Varios perfiles reales con detección de colisiones | ✅ |
 | RFC2217 | Control serie por red | 🔜 |
 | COM virtual nativo en Windows | Nivel driver | 🔜 / puente externo |
 
@@ -254,6 +257,27 @@ cargo test
 Por defecto en macOS/Linux: **2 series virtuales (PTY)** + TCP + WebSocket.  
 Al arrancar imprime una **tarjeta de conexión** (SERIAL / TCP / WS).
 
+También puedes fijar los parámetros completos al iniciar: `--baud`,
+`--data-bits`, `--parity`, `--stop-bits` y `--flow-control` (`none`,
+`software` o `hardware`). `run` acepta los mismos flags como overrides
+temporales sin modificar el TOML.
+
+---
+
+## Consola web serie
+
+`share --ui` o `run --ui` sirve la consola embebida en la misma dirección
+que la API, normalmente **http://127.0.0.1:8787/**. Incluye perfiles de
+sesión, finales de línea y `Ctrl/⌘+Enter`, comandos rápidos, envíos
+temporizados (mínimo 50 ms), checksums `SUM8`/`XOR8`/`CRC16`, log de texto o
+Hex con pausa/scroll/exportación, parseo local `RawData`/`FireWater`/
+`JustFloat` con onda, y control DTR/RTS/BREAK.
+
+Todos los envíos siguen pasando por `POST /v1/write`; los parámetros físicos
+del puerto se fijan al iniciar por CLI/TOML. La guía de build y la tabla de
+funcionalidades están en [`web/README.md`](./web/README.md), y el contrato
+detallado en [`web/PROTOCOL.zh-TW.md`](./web/PROTOCOL.zh-TW.md).
+
 ---
 
 ## Cómo usarlo (escenarios)
@@ -313,6 +337,10 @@ Ejemplo: [`ohmyserial.example.toml`](./ohmyserial.example.toml)
 [real]
 path = "mock:demo"
 baud = 115200
+databits = 8
+parity = "none"
+stopbits = 1
+flow = "none"
 reconnect = true
 
 [tx]
@@ -324,6 +352,9 @@ slow_client = "drop_oldest"
 [api]
 bind = "127.0.0.1:8787"
 enabled = true
+can_read = true
+can_write = true
+can_control = false # true habilita DTR/RTS/BREAK y handoff; cada petición necesita lease
 
 [[clients]]
 type = "tcp"
@@ -351,6 +382,9 @@ format = "hex+text"
 | `real.path` | Ruta del dispositivo o `mock:nombre` |
 | `tx.mode` | Política de escritura concurrente |
 | `api.bind` | Dirección HTTP/WS (preferir localhost) |
+| `api.token_env` | Nombre de la variable de entorno con el Bearer; no se guarda en TOML |
+| `api.cors_origins` | Lista exacta de Origin; vacío = same-origin y `*` se rechaza |
+| `api.can_control` | Habilita DTR/RTS/BREAK y handoff; cada petición necesita un lease |
 | `can_read` / `can_write` | Permisos por cliente |
 
 ---
@@ -359,10 +393,16 @@ format = "hex+text"
 
 ```bash
 ohmyserial run -c ohmyserial.toml    # iniciar hub
+ohmyserial share <device> [opciones de serie/endpoint]
+ohmyserial supervise -c board-a.toml -c board-b.toml
 ohmyserial init [-o file]           # config de ejemplo
 ohmyserial list-ports               # listar puertos
 ohmyserial status [--api URL]       # consultar estado
 ```
+
+`share` es el arranque directo de un dispositivo real o `mock:nombre`; `run`
+usa un TOML y permite overrides temporales de los parámetros de línea y
+endpoints. `supervise` levanta varios perfiles con detección de colisiones.
 
 ```bash
 RUST_LOG=debug ohmyserial run -c ohmyserial.toml
@@ -374,11 +414,26 @@ RUST_LOG=debug ohmyserial run -c ohmyserial.toml
 
 **Base:** `http://127.0.0.1:8787`
 
+La API y el WebSocket dedicado solo escuchan en loopback. Si configuras
+`api.token_env`, todas las rutas `/v1/*` salvo `/v1/health` requieren
+`Authorization: Bearer <token>`; el token no debe aparecer en TOML, URL ni logs.
+Para una página alojada en otro origen, usa `api.cors_origins` con orígenes
+exactos y recuerda que WebSocket valida también `Origin`.
+
 | Método | Ruta | Descripción |
 |--------|------|-------------|
 | `GET` | `/v1/health` | Liveness |
 | `GET` | `/v1/status` | Puerto, clientes, lock, stats |
 | `GET` | `/v1/clients` | Lista de clientes |
+| `GET` | `/v1/endpoints` | PTY/TCP disponibles y estado |
+| `GET` | `/v1/events` | Historial paginado de eventos |
+| `GET` | `/v1/events/status` | Estado del ledger de eventos |
+| `GET` | `/v1/events/export` | Exportar eventos como JSONL |
+| `WS` | `/v1/events/stream` | Stream de eventos en vivo |
+| `POST` | `/v1/workflows/run` | Ejecutar workflow acotado |
+| `POST` | `/v1/control` | DTR/RTS/BREAK mediante el dueño serie |
+| `POST` | `/v1/handoff` | Solicitar entrega controlada |
+| `POST` | `/v1/handoff/resume` | Reanudar después de una entrega |
 | `POST` | `/v1/write` | Enviar text o hex al dispositivo |
 | `POST` | `/v1/lock` | Adquirir lock de escritura |
 | `DELETE` | `/v1/lock` | Liberar lock |
@@ -395,6 +450,14 @@ curl -s -X POST http://127.0.0.1:8787/v1/write \
   -H 'content-type: application/json' \
   -d '{"hex":"41 54 0d 0a","as_client":"agent"}'
 ```
+
+Las escrituras HTTP son atómicas y `ok: true` solo confirma `write_all` +
+`flush` del host, no el ACK del dispositivo. Con un lease activo hay que
+enviar su `lease_token`; el nombre `as_client` solo sirve para auditoría.
+Activa `api.can_control = true` para DTR/RTS/BREAK y usa primero un lease;
+mock no tiene líneas físicas y RTS se rechaza con flow control hardware.
+Para que una herramienta externa abra temporalmente el puerto real, sigue el
+handoff acotado de [`HANDOFF.md`](./HANDOFF.md).
 
 ### WebSocket
 
@@ -472,7 +535,7 @@ Abre `/tmp/ohmyserial-ui` en minicom, screen, Serial Studio, etc.
 
 - Por defecto solo **localhost** (`127.0.0.1`)  
 - Escribir al serie es tocar hardware (reset, comandos peligrosos)  
-- No expongas `0.0.0.0` en redes no confiables sin autenticación (post-MVP)  
+- Puedes configurar Bearer mediante `api.token_env`; aun así HTTP/WS/TCP en claro solo se pueden enlazar a loopback. Para acceso remoto usa un túnel SSH o un reverse proxy TLS
 - Los logs pueden contener secretos del stream del dispositivo  
 
 ---
@@ -486,6 +549,7 @@ oh_myserial/
 ├── README.es.md        # Español
 ├── POSITIONING.md
 ├── ohmyserial.example.toml
+├── web/README.md       # guía de la consola web embebida
 ├── src/ ...
 └── tests/
 ```
@@ -509,9 +573,9 @@ CI: Ubuntu · macOS · Windows.
 
 | Fase | Alcance |
 |------|---------|
-| ✅ MVP | Núcleo, políticas, TCP, HTTP/WS, PTY, mock, logs, CLI |
-| 🔜 Siguiente | Multi-puerto, historial, guía COM en Windows, hardening |
-| 🧭 Después | RFC2217, grabar/reproducir, monitor web ligero, métricas |
+| ✅ Núcleo | Políticas, TCP, HTTP/WS, PTY, mock, logs, CLI y multi-puerto con colisiones |
+| ✅ Control + web | Perfiles, eventos/replay, workflows, lease/handoff, DTR/RTS/BREAK, comandos rápidos, temporizador, checksums y onda |
+| 🔜 Después | RFC2217, guía de puente COM virtual en Windows, más analizadores de protocolo y métricas |
 
 ---
 

@@ -55,6 +55,7 @@
 - [平台支持](#平台支持)
 - [安装与编译](#安装与编译)
 - [快速开始](#快速开始)
+- [Web 串口控制台](#web-串口控制台)
 - [怎么用（场景）](#怎么用场景)
 - [配置说明](#配置说明)
 - [命令行](#命令行)
@@ -137,15 +138,15 @@
 | 写锁租约 | 限时独占发送权 | ✅ |
 | 断线重连 | 可选自动重新打开 | ✅ |
 | TCP 客户端 | 原始双向字节流 | ✅ |
-| HTTP API | health / status / write / lock | ✅ |
+| HTTP API | health / status / endpoints / events / workflows / write / control / handoff / lock | ✅ |
 | WebSocket | 实时 RX（可带历史） | ✅ |
 | Unix PTY | 符号链接虚拟串口 | ✅（macOS/Linux） |
 | 会话日志 | 控制台 + 文件；text/hex | ✅ |
-| Web 串口控制台 | 行尾选择、Ctrl/⌘+Enter、快捷指令、定时发送、文本/Hex 日志与导出 | ✅ |
+| Web 串口控制台 | 会话配置、行尾、Ctrl/⌘+Enter、快捷指令、定时发送、校验和、文本/Hex 日志、FireWater/JustFloat 波形、DTR/RTS/BREAK | ✅ |
 | 事件账本 | 版本化 RX/TX/连接/控制/gap 证据；有界内存 + 可选哈希 NDJSON | ✅ |
 | 安全回放 | 校验后只读的 `immediate` / `original` / `manual` 回放 | ✅ |
 | Mock 口 | `mock:demo` 无硬件回环 | ✅ |
-| TOML + CLI | `run` / `init` / `list-ports` / `status` / `supervise` | ✅ |
+| TOML + CLI | `share` / `run` / `init` / `list-ports` / `status` / `supervise` | ✅ |
 | 单进程多真口 | `supervise` 多 profile | ✅ |
 | RFC2217 | 网络串口控制 | 🔜 |
 | Windows 原生虚拟 COM | 驱动级 | 🔜 / 外部桥接 |
@@ -280,11 +281,44 @@ cargo test
 
 | 参数 | 含义 | 默认 |
 |------|------|------|
+| `--baud N` | 波特率 | `115200` |
+| `--data-bits N` | 数据位（5/6/7/8） | `8` |
+| `--parity VALUE` | 校验（none/odd/even/mark/space） | `none` |
+| `--stop-bits N` | 停止位（1/2） | `1` |
+| `--flow-control VALUE` | 流控（none/software/hardware） | `none` |
 | `--pty N` | N 个虚拟串口（Unix） | macOS/Linux=`2`，Windows=`0` |
 | `--tcp N` | N 个 TCP 端口 | `1` |
-| `--api` | HTTP/WS 地址 | `127.0.0.1:8787` |
+| `--tcp-base N` | TCP 起始端口 | `8788` |
+| `--api HOST:PORT` | HTTP/WS 地址 | `127.0.0.1:8787` |
+| `--quiet` | 不镜像会话日志到终端 | 关闭 |
+| `--ui` | 启动后打开嵌入式 Web 控制台 | 关闭 |
 
 高级：`init` 生成 TOML，或 `run -c file.toml -d 设备 --pty 3`。
+
+---
+
+## Web 串口控制台
+
+`share --ui` / `run --ui` 会打开嵌入式控制台；也可以直接访问 API 根地址：
+
+```text
+http://127.0.0.1:8787/
+```
+
+控制台当前包含：
+
+- host/port 会话配置（保存在当前浏览器，不保存 Bearer Token）；
+- 文本/Hex 发送、无结尾/LF/CR/CRLF、Ctrl/⌘+Enter；
+- 快捷指令、50 ms 起定时发送、SUM8/XOR8/CRC16 校验和预览；
+- 文本/Hex/双栏日志、暂停/自动滚动、时间戳和日志导出；
+- RawData、FireWater CSV、JustFloat LE 分片解析与基础 SVG 波形；
+- 写锁以及受 `api.can_control` + 写锁保护的 DTR/RTS/BREAK 控制。
+
+所有网页写入仍通过 `POST /v1/write`，不会绕过 Hub 的 TX 仲裁、大小限制或
+主机写入确认。串口 baud、data bits、parity、stop bits、flow control 在设备
+打开前由 CLI/TOML 设置；网页不会在运行中隐式改变硬件参数。详细 UI 与 API
+说明见 [`web/README.zh-TW.md`](./web/README.zh-TW.md) 和
+[`web/PROTOCOL.zh-TW.md`](./web/PROTOCOL.zh-TW.md)。
 
 ---
 
@@ -365,6 +399,10 @@ path = "mock:demo"
 # 可选：按 USB 身份选择，避免 COM/tty 重编号后连错设备
 # usb = { vid = 0x10c4, pid = 0xea60, serial_number = "board-01" }
 baud = 115200
+databits = 8
+parity = "none"
+stopbits = 1
+flow = "none"
 reconnect = true
 
 [tx]
@@ -442,6 +480,7 @@ ohmyserial supervise -c board-a.toml -c board-b.toml
 | `api.bind` | HTTP/WS 地址；明文监听始终限制为回环地址 |
 | `api.token_env` | 保存 API Bearer 密钥的环境变量名，密钥不写入 TOML |
 | `api.cors_origins` | 精确的浏览器 Origin 白名单；空值仅同源，拒绝 `*` |
+| `api.can_control` | 显式开启 DTR/RTS/BREAK 与交接能力；每次请求仍需写租约 |
 | `ledger.memory_events` / `memory_bytes` | 始终启用的有界事件证据 ring |
 | `ledger.directory` | 可选的追加式哈希 NDJSON 持久化根目录 |
 | `ledger.stream_capacity` / `rotate_bytes` | 实时事件订阅上限 / 分段大小目标 |
@@ -453,7 +492,9 @@ ohmyserial supervise -c board-a.toml -c board-b.toml
 ## 命令行
 
 ```bash
+ohmyserial share <device> [串口/端点选项]  # 零配置启动 hub
 ohmyserial run -c ohmyserial.toml    # 启动 hub
+ohmyserial supervise -c board-a.toml -c board-b.toml  # 单进程多真口
 ohmyserial init [-o file]           # 生成示例配置
 ohmyserial list-ports               # 列出串口
 ohmyserial status [--api URL]       # 查询运行状态
@@ -461,6 +502,10 @@ ohmyserial replay <source>          # 校验并输出封存的账本捕获
 ohmyserial replay <source> --mode original --speed 2
 ohmyserial replay <source> --mode manual --step 10
 ```
+
+`share` 和 `run` 支持 `--baud`、`--data-bits`、`--parity`、`--stop-bits`、
+`--flow-control`；`run` 的这些选项只临时覆盖 TOML，不会改写配置文件。完整
+参数以 `ohmyserial share --help` / `ohmyserial run --help` 为准。
 
 ```bash
 RUST_LOG=debug ohmyserial run -c ohmyserial.toml
@@ -510,6 +555,12 @@ curl -s -X POST http://127.0.0.1:8787/v1/write \
 HTTP 的 text/hex 都按一次原子命令处理，不受分隔符组帧影响。`ok: true` 表示串口所有者线程已完成主机侧 `write_all` 和 `flush`，不代表设备已解析或确认命令。入队和确认共用 `tx.write_timeout_ms` 截止时间；若错误提示结果可能为 partial/unknown，驱动可能已经写出部分或全部字节，不能盲目重试。
 
 租约生效时，写请求必须携带 `lease_token`。`POST /v1/lock` 首次申请会返回随机 token；带 token 再次 POST 是续租；`DELETE /v1/lock` 带 token 才能释放。状态接口不会泄露 token。
+
+物理控制线默认关闭；设置 `api.can_control = true` 后，先申请写租约，再用
+`POST /v1/control` 操作 DTR/RTS/BREAK。命令由唯一串口 owner 执行并等待主机驱动确认；
+mock 口没有物理控制线，硬件流控启用时 RTS 会被拒绝。需要临时让 PuTTY、SSCOM
+等工具直接打开真串口时，使用 [`HANDOFF.md`](./HANDOFF.md) 的有界交接协议；交接 token
+只可使用一次，不进入状态或事件账本。
 
 ### WebSocket
 
@@ -671,8 +722,9 @@ CI：Ubuntu · macOS · Windows。
 |------|------|
 | ✅ 基础 | 核心 hub、可信 TX、租约、TCP、HTTP/WS、PTY、mock、日志、CLI |
 | ✅ 证据 | 规范事件账本、可选哈希分段、查询/导出/事件 WS、安全回放 |
-| 🔜 下一步 | 受控工作流、设备身份/控制线、独占交接、多端口监督 |
-| 🧭 更后 | RFC2217、Windows COM 桥文档、更丰富的 Web 证据工具、指标导出 |
+| ✅ 控制面 | 有界工作流、设备身份选择、DTR/RTS/BREAK、独占交接、多端口监督 |
+| ✅ Web 调试 | 会话配置、快捷命令、定时发送、校验和、FireWater/JustFloat、波形观察 |
+| 🔜 后续 | RFC2217、Windows COM 桥文档、更多协议分析器、指标导出 |
 
 ---
 

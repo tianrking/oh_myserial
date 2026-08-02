@@ -1,32 +1,87 @@
-# React + TypeScript + Vite
+# ohmyserial Web Console
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+The `web/` directory contains the React + Vite + TypeScript console embedded
+into the Rust binary as `web/dist`. It connects to the hub's HTTP and
+WebSocket endpoints; it does not open a serial device directly.
 
-Currently, two official plugins are available:
+## Run the embedded console
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Build the web assets first, then rebuild the Rust binary so `rust-embed` picks
+up the new `dist` files:
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+cd web
+npm ci
+npm run build
+cd ..
+cargo build --release
+./target/release/ohmyserial share mock:demo --ui
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Open `http://127.0.0.1:8787/`. For a real device, replace `mock:demo` with a
+serial path such as `/dev/ttyUSB0`, `/dev/cu.usbmodemXXXX`, or `COM3` and set
+the line parameters before opening the device:
+
+```bash
+ohmyserial share COM3 --baud 115200 --data-bits 8 --parity none \
+  --stop-bits 1 --flow-control none --ui
+```
+
+The browser console does not silently reconfigure an already-open UART. Baud,
+data bits, parity, stop bits, and flow control remain Hub CLI/TOML settings.
+
+## Console capabilities
+
+- Hub host/port connection profiles stored in the current browser; Bearer
+  tokens remain memory-only.
+- Text and Hex writes with `none`, `LF`, `CR`, or `CRLF` endings and
+  Ctrl/⌘+Enter.
+- Browser-local quick commands and bounded timed sending (50 ms minimum).
+- Optional SUM8, XOR8, CRC16-Modbus, and CRC16-CCITT Hex preprocessing with a
+  visible wire preview.
+- Pause/auto-scroll, timestamp toggle, text/Hex/both log modes, and export.
+- RawData, FireWater CSV, and JustFloat little-endian parsing across chunk
+  boundaries, plus a bounded SVG waveform view.
+- DTR/RTS/BREAK controls through `POST /v1/control`; the Hub must grant
+  `api.can_control` and the page must hold the opaque write lease.
+
+All writes use `POST /v1/write`, so the Hub's TX policy, lease checks, size
+limits, and host-side write confirmation remain in force. The UI is therefore
+an observer/client of the Hub rather than a second serial owner.
+
+## Local hot-reload development
+
+Run the hub and Vite separately:
+
+```bash
+# terminal 1
+cargo run --release -- share mock:demo --pty 2
+
+# terminal 2
+cd web
+npm ci
+npm run dev
+```
+
+Vite normally serves `http://localhost:5173`; the console connects to the Hub
+at `127.0.0.1:8787` by default. Use `npm run build` to validate the embedded
+asset before committing.
+
+## Protocol and security references
+
+- [`PROTOCOL.zh-TW.md`](./PROTOCOL.zh-TW.md) — HTTP/WS contract and browser
+  mapping (Traditional Chinese).
+- [`../EVENTS.md`](../EVENTS.md) — canonical event ledger and event stream.
+- [`../WORKFLOWS.md`](../WORKFLOWS.md) — bounded Agent workflow contract.
+- [`README.zh-TW.md`](./README.zh-TW.md) — Traditional Chinese UI guide.
+
+Plain HTTP/WS/TCP listeners are loopback-only. For remote use, follow the Hub
+documentation for an SSH tunnel or TLS reverse proxy; do not put API tokens in
+URLs.
+
+## Checks
+
+```bash
+npm run build
+npm run lint
+```
