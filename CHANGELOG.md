@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Bounded workflows
+
+- Added a finite linear workflow DSL with lease, atomic send, incremental RX expect, explicit assertions, waits, and reserved control steps.
+- Added server-generated workflow actors, idempotent `request_id` handling, bounded evidence cursors, cancellation, and fail-closed behavior for RX gaps, lag, disconnects, and epoch changes.
+- Added `POST /v1/workflows/run`; physical serial control-line operations remain unavailable until the owner-side command channel is implemented.
+
 ### Event ledger and safe replay
 
 - Added a canonical `ohmyserial.event` v1 envelope with session sequence, UTC/monotonic time, port connection epoch, typed RX/TX/connection/control/gap payloads, and standard padded Base64 byte encoding.

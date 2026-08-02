@@ -209,7 +209,30 @@ API Bearer 用於存取 hub；下文的 `lease_token` 用於獨占 TX，兩者�
 
 ---
 
-### 3.6 `POST /v1/lock`
+### 3.6 `POST /v1/workflows/run`
+
+這是受限的線性 Agent 工作流，不是腳本引擎。步驟只有 `lease`、`send`、`expect`、`assert`、`wait` 與保留的 `control`；沒有迴圈、分支、重試、變數、網路或檔案操作。完整 DSL、上限與證據游標見 [`WORKFLOWS.md`](../WORKFLOWS.md)。
+
+```json
+{
+  "request_id": "probe-001",
+  "lease_token": "optional-opaque-token",
+  "workflow": {
+    "id": "identify",
+    "steps": [
+      { "op": "lease" },
+      { "op": "send", "bytes": { "text": "ATI\r\n" } },
+      { "op": "expect", "pattern": { "text": "OK" }, "timeout_ms": 2000 }
+    ]
+  }
+}
+```
+
+`request_id` 完成後重送會得到相同結果；並行重送會被拒絕，不會執行第二次寫入。服務器生成 `workflow:<uuid>` actor，租約 token 不會出現在回應或事件賬本。`expect` 在 canonical RX 分片之間增量匹配；RX observation gap、游標遺失、斷線與 epoch 變更會 fail-closed，`client_delivery` gap 不會誤判為裝置 RX 遺失。`control` 目前只保留 schema，直到 serial-owner command channel 完成前會回傳 unavailable。
+
+---
+
+### 3.7 `POST /v1/lock`
 
 **用途**：申請寫鎖租約。
 
@@ -242,7 +265,7 @@ API Bearer 用於存取 hub；下文的 `lease_token` 用於獨占 TX，兩者�
 
 ---
 
-### 3.7 `DELETE /v1/lock`
+### 3.8 `DELETE /v1/lock`
 
 **用途**：釋放寫鎖。存在有效租約時必須提交它的 token：
 

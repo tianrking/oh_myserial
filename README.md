@@ -525,6 +525,7 @@ Browser access is same-origin by default. Requests must also carry a Host author
 | `GET` | `/v1/events/status` | Ledger session, ring, persistence, and recovery status |
 | `GET` | `/v1/events` | Cursor query with type/epoch/actor/byte filters |
 | `GET` | `/v1/events/export` | Canonical event NDJSON export |
+| `POST` | `/v1/workflows/run` | Bounded linear lease/send/expect workflow |
 | `POST` | `/v1/write` | Send text or hex to device |
 | `POST` | `/v1/lock` | Acquire write lock |
 | `DELETE` | `/v1/lock` | Release write lock |
@@ -606,7 +607,7 @@ The raw `/v1/stream` WebSocket carries bidirectional serial bytes. `/v1/events/s
 
 Segment hashes detect corruption and broken chains, but they are not signatures or proof of origin. There is no automatic retention deletion. RX evidence begins when the process successfully reads bytes; loss in hardware or a driver before that point may be unknowable. Host-side TX `write_all` + `flush` is not a device acknowledgement. Mock tests are not hardware-in-the-loop tests.
 
-See [`EVENTS.md`](./EVENTS.md) for the complete envelope, event types, gap semantics, storage/recovery model, API pagination and WebSocket recovery flow, and replay safety contract.
+See [`EVENTS.md`](./EVENTS.md) for the complete envelope, event types, gap semantics, storage/recovery model, API pagination and WebSocket recovery flow, and replay safety contract. See [`WORKFLOWS.md`](./WORKFLOWS.md) for the bounded workflow DSL and evidence cursor rules.
 
 ---
 
@@ -684,6 +685,7 @@ oh_myserial/
 ├── README.es.md
 ├── POSITIONING.md
 ├── EVENTS.md                 # Canonical event ledger, persistence, API, replay
+├── WORKFLOWS.md              # Bounded linear agent workflow contract
 ├── ohmyserial.example.toml
 ├── web/                      # Optional React console (Traditional Chinese)
 │   ├── PROTOCOL.zh-TW.md     # Full HTTP/WS protocol
@@ -733,7 +735,8 @@ CI: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) — Ubuntu, macOS, 
 |-------|--------|
 | ✅ Foundation | Hub core, trusted TX, leases, TCP, HTTP/WS, Unix PTY, mock, logs, CLI |
 | ✅ Evidence | Canonical event ledger, optional hashed segments, query/export/event WS, safe replay |
-| 🔜 Next | Controlled workflows, device identity/control lines, handoff, multi-port supervision |
+| ✅ Automation | Bounded linear workflows with evidence cursors and idempotent request IDs |
+| 🔜 Next | Device identity/control lines, handoff, multi-port supervision |
 | 🧭 Later | RFC2217, Windows COM bridge guide, richer web evidence tooling, metrics |
 
 Not core goals: cloud SaaS, heavy GUI installer, kernel virtual-COM driver (unless demand is clear).

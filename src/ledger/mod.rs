@@ -428,6 +428,29 @@ impl Ledger {
         self.shared.live.subscribe()
     }
 
+    /// Subscribe and snapshot the high-water mark while holding the ledger
+    /// state lock. Adapters use this pair to avoid the race where an event is
+    /// appended between an ordinary `subscribe()` and `status()` call.
+    pub fn subscribe_with_status(&self) -> (broadcast::Receiver<EventEnvelope>, LedgerStatus) {
+        let state = self.shared.state.lock();
+        let receiver = self.shared.live.subscribe();
+        let status = LedgerStatus {
+            session_id: state.session_id,
+            newest_seq: state.newest_seq,
+            oldest_available_seq: state.ring.front().map(|entry| entry.event.seq),
+            retained_events: state.ring.len(),
+            retained_bytes: state.ring_bytes,
+            evicted_events: state.evicted_events,
+            persistence: state.persistence_state,
+            persistence_directory: state.persistence_directory.clone(),
+            persistence_error: state.persistence_error.clone(),
+            sealed: state.sealed,
+            recovery: state.recovery.clone(),
+            stale_recovery: state.stale_recovery.clone(),
+        };
+        (receiver, status)
+    }
+
     /// Wait until at least one canonical event exists after `seq` and return
     /// the current newest sequence. This double-check loop is race-free with
     /// respect to notifications arriving between observation and waiting.

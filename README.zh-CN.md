@@ -455,6 +455,7 @@ RUST_LOG=debug ohmyserial run -c ohmyserial.toml
 | `GET` | `/v1/events/status` | 账本会话、ring、持久化和恢复状态 |
 | `GET` | `/v1/events` | 按游标查询，可过滤类型/epoch/actor/字节 |
 | `GET` | `/v1/events/export` | 规范事件 NDJSON 导出 |
+| `POST` | `/v1/workflows/run` | 有界线性 lease/send/expect 工作流 |
 | `POST` | `/v1/write` | 向设备发送 text 或 hex |
 | `POST` | `/v1/lock` | 申请写锁 |
 | `DELETE` | `/v1/lock` | 释放写锁 |
@@ -532,7 +533,7 @@ ohmyserial replay ./one-session-directory --mode original --speed 2
 
 分段哈希能发现损坏和链断裂，但不是数字签名或来源证明；程序也不会自动删除旧分段。RX 证据从进程成功读到字节时才开始，硬件或驱动在此之前的丢失可能无法得知。主机侧 TX `write_all` + `flush` 不等于设备确认。Mock 测试也不等于硬件在环测试。
 
-完整的 envelope、事件类型、gap 语义、存储/恢复模型、API 分页与 WebSocket 补流流程、回放安全边界见 [`EVENTS.md`](./EVENTS.md)。
+完整的 envelope、事件类型、gap 语义、存储/恢复模型、API 分页与 WebSocket 补流流程、回放安全边界见 [`EVENTS.md`](./EVENTS.md)；工作流 DSL 和证据游标见 [`WORKFLOWS.md`](./WORKFLOWS.md)。
 
 ---
 
@@ -610,6 +611,7 @@ oh_myserial/
 ├── README.es.md        # Español
 ├── POSITIONING.md
 ├── EVENTS.md           # 规范事件账本、持久化、API、回放
+├── WORKFLOWS.md        # 有界线性 Agent 工作流契约
 ├── ohmyserial.example.toml
 ├── src/ ...
 └── tests/

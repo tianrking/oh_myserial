@@ -7,6 +7,7 @@ use crate::ledger::{Ledger, LedgerOptions, MemoryOptions, StoreOptions};
 use crate::observe::SessionLog;
 use crate::policy::Policy;
 use crate::serial::SerialHub;
+use crate::workflow::{WorkflowLimits, WorkflowRunner};
 
 #[cfg(unix)]
 use crate::client::{prepare_pty_client, PreparedPtyClient};
@@ -218,6 +219,7 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
             });
         let st = ApiState {
             broker: broker.clone(),
+            workflow_runner: WorkflowRunner::new(WorkflowLimits::default())?,
             default_writer: "api".into(),
             ws_writer,
             history_on_ws_connect: history,
@@ -262,6 +264,7 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
                     if !cfg.api.enabled || bind != &cfg.api.bind {
                         let st = ApiState {
                             broker: broker.clone(),
+                            workflow_runner: WorkflowRunner::new(WorkflowLimits::default())?,
                             default_writer: name.clone(),
                             ws_writer: name.clone(),
                             history_on_ws_connect: *history_bytes,

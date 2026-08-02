@@ -11,6 +11,7 @@ use ohmyserial::client::{spawn_api_server_owned, ApiServerHandle, ApiState};
 use ohmyserial::ledger::{Ledger, LedgerOptions, MemoryOptions, StoreOptions};
 use ohmyserial::observe::SessionLog;
 use ohmyserial::policy::{Policy, SlowClientPolicy, TxMode};
+use ohmyserial::workflow::{WorkflowLimits, WorkflowRunner};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -122,6 +123,8 @@ async fn start_server(ledger: Ledger, access: ApiAccess) -> TestServer {
     let api = spawn_api_server_owned(
         ApiState {
             broker: split.broker.clone(),
+            workflow_runner: WorkflowRunner::new(WorkflowLimits::default())
+                .expect("workflow limits"),
             default_writer: "api-test".into(),
             ws_writer: "ws-test".into(),
             history_on_ws_connect: 4_096,
@@ -589,4 +592,61 @@ async fn event_api_enforces_permissions_and_never_serializes_bearer_or_lease_tok
     )
     .await;
     denied.shutdown().await;
+}
+
+#[tokio::test]
+async fn workflow_api_runs_linear_expect_and_is_idempotent_without_token_leak() {
+    let server = start_server(memory_ledger(64), ApiAccess::default()).await;
+    let body = json!({
+        "request_id": "workflow-api-1",
+        "workflow": {
+            "id": "wait-for-ok",
+            "steps": [
+                {"op": "lease"},
+                {"op": "expect", "pattern": {"text": "OK"}, "timeout_ms": 1000, "capture": "reply"}
+            ]
+        }
+    })
+    .to_string();
+    let body_for_request = body.clone();
+    let addr = server.addr;
+    let request = tokio::spawn(async move {
+        http_request(
+            addr,
+            "POST",
+            "/v1/workflows/run",
+            &[("Content-Type", "application/json")],
+            &body_for_request,
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    for _ in 0..100 {
+        if server.broker.ledger().status().newest_seq > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    server.broker.on_device_rx(Bytes::from_static(b"O"));
+    server.broker.on_device_rx(Bytes::from_static(b"K"));
+    let response = request.await.unwrap();
+    assert_eq!(response.status, 200, "response={response:?}");
+    assert_eq!(response.json()["result"]["status"], "succeeded");
+    assert!(response.json()["result"]["actor"]
+        .as_str()
+        .unwrap()
+        .starts_with("workflow:"));
+    assert!(!response.body.contains("lease_token"));
+
+    let replay = http_request(
+        server.addr,
+        "POST",
+        "/v1/workflows/run",
+        &[("Content-Type", "application/json")],
+        &body,
+    )
+    .await;
+    assert_eq!(replay.status, 200, "response={replay:?}");
+    assert_eq!(replay.json()["result"], response.json()["result"]);
+    server.shutdown().await;
 }

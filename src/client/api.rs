@@ -24,10 +24,14 @@ use tower_http::trace::TraceLayer;
 use crate::broker::{Broker, WriteLockView};
 use crate::client::static_ui::{static_handler, ui_embedded};
 use crate::ledger::{EventFilter, EventQuery, EventType, QueryPage};
+use crate::workflow::{
+    BrokerWorkflowRuntime, WorkflowAuthorization, WorkflowDefinition, WorkflowError, WorkflowRunner,
+};
 
 #[derive(Clone)]
 pub struct ApiState {
     pub broker: Broker,
+    pub workflow_runner: WorkflowRunner,
     /// Default client name for API writes when not specified.
     pub default_writer: String,
     /// Server-configured identity and permissions for WebSocket clients.
@@ -131,6 +135,7 @@ pub async fn spawn_api_server_owned(
         .route("/v1/events", get(events_query))
         .route("/v1/events/export", get(events_export))
         .route("/v1/events/stream", get(events_stream))
+        .route("/v1/workflows/run", post(workflow_run))
         .route("/v1/write", post(write))
         .route("/v1/lock", post(lock).delete(unlock))
         // Unlimited concurrent agents/monitors share the same stream path.
@@ -748,6 +753,85 @@ async fn handle_events_ws(
             }
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRunBody {
+    request_id: String,
+    workflow: WorkflowDefinition,
+    #[serde(default)]
+    lease_token: Option<String>,
+}
+
+async fn workflow_run(
+    State(st): State<Arc<ApiState>>,
+    Extension(shutdown): Extension<CancellationToken>,
+    Json(body): Json<WorkflowRunBody>,
+) -> Response {
+    if !st.can_read {
+        return permission_denied("workflow read access");
+    }
+    let authorization = WorkflowAuthorization {
+        can_read: st.can_read,
+        can_write: st.can_write,
+        // Physical control operations are deliberately denied by the broker
+        // adapter until they have an owner-side command/ack path.
+        can_control: false,
+        lease_token: body.lease_token,
+    };
+    let runtime = BrokerWorkflowRuntime::new(st.broker.clone());
+    let cancellation = CancellationToken::new();
+    let runner = st.workflow_runner.clone();
+    let request_id = body.request_id;
+    let workflow = body.workflow;
+    let result = tokio::select! {
+        result = runner.run(&runtime, &request_id, &workflow, authorization, cancellation.clone()) => result,
+        _ = shutdown.cancelled() => {
+            cancellation.cancel();
+            Err(WorkflowError::Cancelled)
+        }
+    };
+    match result {
+        Ok(result) => Json(serde_json::json!({ "ok": true, "result": result })).into_response(),
+        Err(error) => workflow_error_response(error),
+    }
+}
+
+fn workflow_error_response(error: WorkflowError) -> Response {
+    let status = match error {
+        WorkflowError::ReadDenied | WorkflowError::WriteDenied | WorkflowError::ControlDenied => {
+            StatusCode::FORBIDDEN
+        }
+        WorkflowError::RequestInProgress => StatusCode::CONFLICT,
+        WorkflowError::Cancelled => StatusCode::REQUEST_TIMEOUT,
+        WorkflowError::Timeout | WorkflowError::ExpectTimeout => StatusCode::REQUEST_TIMEOUT,
+        WorkflowError::Runtime(_) | WorkflowError::CursorUnavailable(_) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        WorkflowError::InvalidDefinition(_)
+        | WorkflowError::InvalidLimits
+        | WorkflowError::StepLimit { .. }
+        | WorkflowError::DurationLimit { .. }
+        | WorkflowError::BytesLimit { .. }
+        | WorkflowError::PatternLimit { .. }
+        | WorkflowError::InvalidBytes(_)
+        | WorkflowError::InvalidRequestId
+        | WorkflowError::EvidenceGap { .. }
+        | WorkflowError::WrongSession
+        | WorkflowError::EpochChanged { .. }
+        | WorkflowError::Disconnected
+        | WorkflowError::RxGap(_)
+        | WorkflowError::Assertion(_)
+        | WorkflowError::EvidenceLimit => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": error.to_string(),
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
