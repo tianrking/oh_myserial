@@ -9,7 +9,15 @@ export interface QuickCommand {
   lineEnding: LineEnding;
 }
 
+export interface ConnectionProfile {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+}
+
 export const QUICK_COMMANDS_STORAGE_KEY = "ohmyserial.web.quickCommands";
+export const CONNECTION_PROFILES_STORAGE_KEY = "ohmyserial.web.connectionProfiles";
 
 export function appendLineEnding(value: string, ending: LineEnding): string {
   if (ending === "lf") return `${value}\n`;
@@ -73,8 +81,41 @@ export function loadQuickCommands(): QuickCommand[] {
   }
 }
 
+export function loadConnectionProfiles(): ConnectionProfile[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(CONNECTION_PROFILES_STORAGE_KEY);
+    if (!raw) return [];
+    const value: unknown = JSON.parse(raw);
+    if (!Array.isArray(value)) return [];
+    return value.flatMap((item): ConnectionProfile[] => {
+      if (!item || typeof item !== "object") return [];
+      const record = item as Record<string, unknown>;
+      if (
+        typeof record.id !== "string" ||
+        typeof record.name !== "string" ||
+        !record.name.trim() ||
+        typeof record.host !== "string" ||
+        !record.host.trim() ||
+        !Number.isInteger(record.port) ||
+        Number(record.port) < 1 ||
+        Number(record.port) > 65535
+      ) {
+        return [];
+      }
+      return [{ id: record.id, name: record.name, host: record.host, port: Number(record.port) }];
+    });
+  } catch {
+    return [];
+  }
+}
+
 export function newCommandId(): string {
   const randomUuid = globalThis.crypto?.randomUUID;
   return randomUuid ? randomUuid.call(globalThis.crypto) : `cmd-${Date.now()}-${Math.random()}`;
 }
 
+export function newProfileId(): string {
+  const randomUuid = globalThis.crypto?.randomUUID;
+  return randomUuid ? randomUuid.call(globalThis.crypto) : `profile-${Date.now()}-${Math.random()}`;
+}

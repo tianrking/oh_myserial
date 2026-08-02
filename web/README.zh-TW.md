@@ -7,6 +7,7 @@
 | 功能 | 狀態 |
 |------|------|
 | 設定 host/port，localStorage 記住 | ✅ |
+| 本機瀏覽器會話配置（儲存 / 載入 / 刪除） | ✅ |
 | `GET /v1/health` 探活 | ✅ |
 | `GET /v1/status` 狀態 / 寫鎖 / 統計 | ✅ |
 | `GET /v1/endpoints` 並聯端點列表 + 複製 | ✅ |
@@ -16,6 +17,7 @@
 | 文字行尾選擇（無 / LF / CR / CRLF）與 Ctrl/⌘+Enter | ✅ |
 | 快捷指令（文字 / Hex、行尾、編輯、刪除、localStorage） | ✅ |
 | 定時發送（50 ms 起、文字 / Hex） | ✅ |
+| Hex 校驗和預處理（SUM8 / XOR8 / CRC16 Modbus / CCITT） | ✅ |
 | 日誌顯示模式（文字 / Hex / 兩者）、時間戳、匯出 | ✅ |
 | FireWater CSV / JustFloat LE 分片解析與波形觀察 | ✅ |
 | DTR / RTS / BREAK 控制線入口（授權 + 寫鎖保護） | ✅ |
@@ -37,6 +39,12 @@
 串口的 baud、data bits、parity、stop bits、flow control 仍由 `run` / `share`
 的 TOML/CLI 設定，在 Hub 重新開啟實體埠時套用；控制台顯示目前埠與 baud，避免
 網頁偷偷改變硬體參數。
+
+例如 Windows 可直接使用：
+
+```bash
+ohmyserial share COM3 --baud 115200 --data-bits 8 --parity none --stop-bits 1 --flow-control none
+```
 
 ## 推薦用法：嵌在 hub 裡（同源，最穩）
 

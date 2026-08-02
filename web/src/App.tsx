@@ -11,15 +11,24 @@ import { httpBase, wsUrl } from "./api/types";
 import { bytesToHex, bytesToText, connectStream } from "./api/wsStream";
 import {
   appendLineEnding,
+  CONNECTION_PROFILES_STORAGE_KEY,
+  loadConnectionProfiles,
   loadQuickCommands,
   newCommandId,
+  newProfileId,
   QUICK_COMMANDS_STORAGE_KEY,
   type CommandMode,
+  type ConnectionProfile,
   type LineEnding,
   type QuickCommand,
 } from "./commandUtils";
 import EventLedgerPanel from "./EventLedgerPanel";
 import WaveformPanel from "./WaveformPanel";
+import {
+  appendHexChecksum,
+  checksumLabel,
+  type HexChecksum,
+} from "./checksumUtils";
 import {
   parseFireWater,
   parseJustFloat,
@@ -94,6 +103,11 @@ export default function App() {
   const [conn, setConn] = useState<ConnectionConfig>(loadConn);
   const [hostInput, setHostInput] = useState(conn.host);
   const [portInput, setPortInput] = useState(String(conn.port));
+  const [connectionProfiles, setConnectionProfiles] = useState<ConnectionProfile[]>(
+    loadConnectionProfiles,
+  );
+  const [selectedProfileId, setSelectedProfileId] = useState("");
+  const [profileName, setProfileName] = useState("");
   // Optional remote-API bearer. It is deliberately never persisted.
   const [apiTokenInput, setApiTokenInput] = useState("");
   const apiBearerToken = apiTokenInput.trim() || undefined;
@@ -119,6 +133,7 @@ export default function App() {
 
   const [sendText, setSendText] = useState("");
   const [sendHex, setSendHex] = useState("");
+  const [hexChecksum, setHexChecksum] = useState<HexChecksum>("none");
   const [lineEnding, setLineEnding] = useState<LineEnding>("lf");
   const [autoSend, setAutoSend] = useState(false);
   const [autoIntervalMs, setAutoIntervalMs] = useState(1000);
@@ -155,6 +170,14 @@ export default function App() {
     }
   }, [quickCommands]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(CONNECTION_PROFILES_STORAGE_KEY, JSON.stringify(connectionProfiles));
+    } catch {
+      // Keep profiles usable in memory when storage is unavailable.
+    }
+  }, [connectionProfiles]);
+
   const pushLog = useCallback((line: Omit<LogLine, "id" | "ts"> & { ts?: string }) => {
     setLogs((prev) => {
       const next: LogLine = {
@@ -180,6 +203,45 @@ export default function App() {
     setOnline(true);
     setError(null);
   }, []);
+
+  const saveConnectionProfile = () => {
+    const name = profileName.trim();
+    const host = hostInput.trim();
+    const port = Number(portInput);
+    if (!name || !host || !Number.isInteger(port) || port < 1 || port > 65535) {
+      pushLog({ kind: "err", text: "会话配置需要名称、主机和有效端口" });
+      return;
+    }
+    const profile: ConnectionProfile = {
+      id: selectedProfileId || newProfileId(),
+      name,
+      host,
+      port,
+    };
+    setConnectionProfiles((previous) => [profile, ...previous.filter((item) => item.id !== profile.id)].slice(0, 50));
+    setSelectedProfileId(profile.id);
+    setProfileName(profile.name);
+    pushLog({ kind: "sys", text: `已保存会话配置：${profile.name}` });
+  };
+
+  const loadConnectionProfile = (id: string) => {
+    setSelectedProfileId(id);
+    const profile = connectionProfiles.find((item) => item.id === id);
+    if (!profile) return;
+    setProfileName(profile.name);
+    setHostInput(profile.host);
+    setPortInput(String(profile.port));
+    pushLog({ kind: "sys", text: `已载入会话配置：${profile.name}` });
+  };
+
+  const deleteConnectionProfile = () => {
+    if (!selectedProfileId) return;
+    const profile = connectionProfiles.find((item) => item.id === selectedProfileId);
+    setConnectionProfiles((previous) => previous.filter((item) => item.id !== selectedProfileId));
+    setSelectedProfileId("");
+    setProfileName("");
+    if (profile) pushLog({ kind: "sys", text: `已删除会话配置：${profile.name}` });
+  };
 
   const consumeWaveBytes = useCallback(
     (data: Uint8Array) => {
@@ -358,7 +420,12 @@ export default function App() {
   );
 
   const transmit = useCallback(
-    async (mode: CommandMode, payload: string, ending: LineEnding): Promise<boolean> => {
+    async (
+      mode: CommandMode,
+      payload: string,
+      ending: LineEnding,
+      checksum: HexChecksum = "none",
+    ): Promise<boolean> => {
       if (mode === "text" ? payload.length === 0 : payload.trim().length === 0) return false;
       setBusy(true);
       try {
@@ -378,13 +445,17 @@ export default function App() {
               .replace(/\n/g, "\\n")}`,
           });
         } else {
-          const r = await hubApi.writeHex(conn, payload, {
+          const wire = appendHexChecksum(payload, checksum);
+          const r = await hubApi.writeHex(conn, wire, {
             as_client: CLIENT_NAME,
             lease_token: leaseToken ?? undefined,
             bearer_token: apiBearerToken,
           });
           if (!r.ok) throw new Error(r.error || "写入失败");
-          pushLog({ kind: "tx", text: `HTTP 写入 hex ${r.bytes} bytes：${payload}` });
+          pushLog({
+            kind: "tx",
+            text: `HTTP 写入 hex ${r.bytes} bytes：${wire}${checksum !== "none" ? `（${checksumLabel(checksum)}）` : ""}`,
+          });
         }
         return true;
       } catch (e) {
@@ -402,17 +473,31 @@ export default function App() {
 
   const onSendText = () => void transmit("text", sendText, lineEnding);
 
-  const onSendHex = () => void transmit("hex", sendHex, "none");
+  const onSendHex = () => void transmit("hex", sendHex, "none", hexChecksum);
+
+  const hexPreview = useMemo(() => {
+    if (!sendHex.trim()) return "";
+    try {
+      return appendHexChecksum(sendHex, hexChecksum);
+    } catch (e) {
+      return e instanceof Error ? `错误：${e.message}` : `错误：${String(e)}`;
+    }
+  }, [hexChecksum, sendHex]);
 
   useEffect(() => {
     if (!autoSend || !online || autoIntervalMs < 50) return;
     const timer = window.setInterval(() => {
       if (busy) return;
       const payload = autoMode === "text" ? sendText : sendHex;
-      void transmit(autoMode, payload, autoMode === "text" ? lineEnding : "none");
+      void transmit(
+        autoMode,
+        payload,
+        autoMode === "text" ? lineEnding : "none",
+        autoMode === "hex" ? hexChecksum : "none",
+      );
     }, autoIntervalMs);
     return () => window.clearInterval(timer);
-  }, [autoIntervalMs, autoMode, autoSend, busy, lineEnding, online, sendHex, sendText, transmit]);
+  }, [autoIntervalMs, autoMode, autoSend, busy, hexChecksum, lineEnding, online, sendHex, sendText, transmit]);
 
   const resetQuickEditor = () => {
     setEditingCommandId(null);
@@ -611,6 +696,38 @@ export default function App() {
             斷開
           </button>
         </div>
+        <div className="row profile-row">
+          <label>
+            会话配置
+            <select value={selectedProfileId} onChange={(e) => loadConnectionProfile(e.target.value)}>
+              <option value="">选择已保存配置</option>
+              {connectionProfiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.name} · {profile.host}:{profile.port}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            配置名称
+            <input
+              value={profileName}
+              onChange={(e) => setProfileName(e.target.value)}
+              placeholder="例如 本机 Hub"
+            />
+          </label>
+          <button type="button" className="ghost" onClick={saveConnectionProfile}>
+            保存配置
+          </button>
+          <button
+            type="button"
+            className="ghost"
+            disabled={!selectedProfileId}
+            onClick={deleteConnectionProfile}
+          >
+            删除配置
+          </button>
+        </div>
         <p className="hint">
           請先在本機執行：
           <code>ohmyserial share mock:demo</code> 或真實裝置。 HTTP：
@@ -805,6 +922,26 @@ export default function App() {
                 placeholder="41 54 0d 0a"
               />
             </label>
+            <div className="row composer-options">
+              <label>
+                校验和
+                <select
+                  value={hexChecksum}
+                  onChange={(e) => setHexChecksum(e.target.value as HexChecksum)}
+                >
+                  <option value="none">不添加校验</option>
+                  <option value="sum8">SUM8</option>
+                  <option value="xor8">XOR8</option>
+                  <option value="crc16-modbus">CRC16-Modbus (Lo/Hi)</option>
+                  <option value="crc16-ccitt">CRC16-CCITT (Hi/Lo)</option>
+                </select>
+              </label>
+              {hexPreview && (
+                <span className={`hint inline-hint ${hexPreview.startsWith("错误") ? "error" : ""}`}>
+                  发送预览：<code>{hexPreview}</code>
+                </span>
+              )}
+            </div>
             <button type="button" disabled={!online || busy} onClick={() => void onSendHex()}>
               送出 Hex
             </button>

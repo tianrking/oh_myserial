@@ -35,6 +35,18 @@ enum Commands {
         /// Baud rate
         #[arg(short, long, default_value_t = 115_200)]
         baud: u32,
+        /// Data bits (5, 6, 7, or 8)
+        #[arg(long = "data-bits", default_value_t = 8, value_parser = clap::value_parser!(u8).range(5..=8))]
+        data_bits: u8,
+        /// Parity: none, odd, even, mark, or space
+        #[arg(long, default_value = "none", value_parser = ["none", "odd", "even", "mark", "space"])]
+        parity: String,
+        /// Stop bits (1 or 2)
+        #[arg(long = "stop-bits", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+        stop_bits: u8,
+        /// Flow control: none, software (XON/XOFF), or hardware (RTS/CTS)
+        #[arg(long = "flow-control", alias = "flow", default_value = "none", value_parser = ["none", "software", "hardware"])]
+        flow: String,
         /// Number of virtual serial ports (macOS/Linux PTY). Default: 2 on Unix, 0 on Windows.
         #[arg(long, default_value_t = default_pty_cli())]
         pty: u32,
@@ -65,6 +77,18 @@ enum Commands {
         /// Optional: override baud
         #[arg(short, long)]
         baud: Option<u32>,
+        /// Optional: override data bits
+        #[arg(long = "data-bits", value_parser = clap::value_parser!(u8).range(5..=8))]
+        data_bits: Option<u8>,
+        /// Optional: override parity
+        #[arg(long, value_parser = ["none", "odd", "even", "mark", "space"])]
+        parity: Option<String>,
+        /// Optional: override stop bits
+        #[arg(long = "stop-bits", value_parser = clap::value_parser!(u8).range(1..=2))]
+        stop_bits: Option<u8>,
+        /// Optional: override flow control
+        #[arg(long = "flow-control", alias = "flow", value_parser = ["none", "software", "hardware"])]
+        flow: Option<String>,
         /// Optional: override fanout.pty_count
         #[arg(long)]
         pty: Option<u32>,
@@ -138,6 +162,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Share {
             device,
             baud,
+            data_bits,
+            parity,
+            stop_bits,
+            flow,
             pty,
             tcp,
             tcp_base,
@@ -147,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             eprintln!("ohmyserial share");
             eprintln!("  device = {device}");
-            eprintln!("  baud   = {baud}");
+            eprintln!("  serial = {baud}-{data_bits}-{parity}-{stop_bits} ({flow})");
             eprintln!("  pty    = {pty} virtual serial(s)  (Unix PTY)");
             eprintln!("  tcp    = {tcp} port(s) from {tcp_base}");
             eprintln!("  api/ws = {api}");
@@ -157,6 +185,10 @@ async fn main() -> anyhow::Result<()> {
             let cfg = Config::from_quick(QuickShare {
                 device,
                 baud,
+                databits: data_bits,
+                parity,
+                stopbits: stop_bits,
+                flow,
                 pty_count: pty,
                 tcp_count: tcp,
                 tcp_base_port: tcp_base,
@@ -169,6 +201,10 @@ async fn main() -> anyhow::Result<()> {
             config,
             device,
             baud,
+            data_bits,
+            parity,
+            stop_bits,
+            flow,
             pty,
             tcp,
             ui,
@@ -181,6 +217,18 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(b) = baud {
                 cfg.real.baud = b;
+            }
+            if let Some(bits) = data_bits {
+                cfg.real.databits = bits;
+            }
+            if let Some(value) = parity {
+                cfg.real.parity = value;
+            }
+            if let Some(bits) = stop_bits {
+                cfg.real.stopbits = bits;
+            }
+            if let Some(value) = flow {
+                cfg.real.flow = value;
             }
             if let Some(p) = pty {
                 cfg.fanout.pty_count = p;

@@ -12,6 +12,9 @@ All notable changes to this project are documented in this file.
 - Added text/Hex/both log display modes, timestamp toggle, and page-log export.
 - Added chunk-safe FireWater CSV and JustFloat little-endian float parsing with a bounded SVG waveform view.
 - Added guarded DTR/RTS/BREAK controls to the console; API capability and write lease remain mandatory.
+- Added complete quick-start serial parameter flags: data bits, parity, stop bits, and flow control, with matching `run` overrides.
+- Added browser-local connection profiles for repeatable Hub host/port sessions without persisting bearer tokens.
+- Added optional Hex checksum preprocessing with visible wire preview (SUM8, XOR8, CRC16-Modbus, CRC16-CCITT).
 - Documented the PuTTY/SSCOM/VOFA+-inspired interaction model and the boundary that serial hardware parameters remain Hub CLI/TOML configuration.
 
 ### Device identity

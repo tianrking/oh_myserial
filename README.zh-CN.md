@@ -150,6 +150,16 @@
 | RFC2217 | 网络串口控制 | 🔜 |
 | Windows 原生虚拟 COM | 驱动级 | 🔜 / 外部桥接 |
 
+快速启动时也可以直接指定完整串口参数：
+
+```bash
+ohmyserial share COM3 --baud 115200 --data-bits 8 --parity none --stop-bits 1 --flow-control none
+```
+
+`--parity` 支持 `none/odd/even/mark/space`，`--flow-control` 支持
+`none/software/hardware`。TOML 的 `[real]` 配置仍支持相同字段；`run` 命令
+可用同名选项临时覆盖，不会改写配置文件。
+
 ### 技术特性
 
 | 方面 | 技术 |

@@ -250,6 +250,12 @@ td code {
   margin: 0;
 }
 
+.profile-row {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
 .interval-input {
   min-width: 6.5rem;
   width: 6.5rem;

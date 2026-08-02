@@ -350,6 +350,10 @@ pub struct EndpointDesc {
 pub struct QuickShare {
     pub device: String,
     pub baud: u32,
+    pub databits: u8,
+    pub parity: String,
+    pub stopbits: u8,
+    pub flow: String,
     pub pty_count: u32,
     pub tcp_count: u32,
     pub tcp_base_port: u16,
@@ -362,6 +366,10 @@ impl Default for QuickShare {
         Self {
             device: "mock:demo".into(),
             baud: 115_200,
+            databits: 8,
+            parity: "none".into(),
+            stopbits: 1,
+            flow: "none".into(),
             // People-friendly defaults: 2 virtual serials on Unix; TCP everywhere.
             pty_count: default_friendly_pty_count(),
             tcp_count: 1,
@@ -420,10 +428,10 @@ impl Config {
                 path: q.device,
                 usb: None,
                 baud: q.baud,
-                databits: 8,
-                parity: "none".into(),
-                stopbits: 1,
-                flow: "none".into(),
+                databits: q.databits,
+                parity: q.parity,
+                stopbits: q.stopbits,
+                flow: q.flow,
                 reconnect: true,
                 reconnect_ms: 1000,
                 read_timeout_ms: 50,
@@ -1080,6 +1088,10 @@ bind = "127.0.0.1:9999"
         let cfg = Config::from_quick(QuickShare {
             device: "mock:x".into(),
             baud: 9600,
+            databits: 7,
+            parity: "even".into(),
+            stopbits: 2,
+            flow: "software".into(),
             pty_count: 0,
             tcp_count: 2,
             tcp_base_port: 19010,
@@ -1088,6 +1100,10 @@ bind = "127.0.0.1:9999"
         })
         .unwrap();
         assert_eq!(cfg.real.baud, 9600);
+        assert_eq!(cfg.real.databits, 7);
+        assert_eq!(cfg.real.parity, "even");
+        assert_eq!(cfg.real.stopbits, 2);
+        assert_eq!(cfg.real.flow, "software");
         assert_eq!(cfg.clients.len(), 2);
         let guide = cfg.connect_guide();
         assert!(guide.contains("how to connect"));
