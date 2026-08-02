@@ -643,6 +643,11 @@ impl Broker {
         // physical handle; a fresh lease can be acquired after resume.
         let released_lease = {
             let mut g = self.state.lock();
+            if let Some(handoff) = g.handoff.as_mut() {
+                // Start the public TTL only after the owner has actually
+                // released the handle and acknowledged the boundary.
+                handoff.expires_at = Instant::now() + Duration::from_millis(duration_ms);
+            }
             g.lock.take().map(|lock| lock.owner)
         };
         let _ = self.record_event(

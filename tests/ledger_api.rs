@@ -711,3 +711,88 @@ async fn control_api_requires_capability_lease_and_owner_ack() {
     assert!(!response.body.contains("lease_token"));
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn handoff_api_returns_one_time_token_without_leaking_it_to_status_or_events() {
+    let access = ApiAccess {
+        can_control: true,
+        ..ApiAccess::default()
+    };
+    let server = start_server(memory_ledger(64), access).await;
+    let (control_tx, mut control_rx) = mpsc::channel(1);
+    server.broker.attach_serial_control(control_tx);
+    let lock = http_request(
+        server.addr,
+        "POST",
+        "/v1/lock",
+        &[("Content-Type", "application/json")],
+        &json!({"as_client": "maintenance"}).to_string(),
+    )
+    .await;
+    let lease_token = lock.json()["lock"]["lease_token"]
+        .as_str()
+        .expect("lease token")
+        .to_owned();
+    let begin_body = json!({
+        "as_client": "maintenance",
+        "lease_token": lease_token,
+        "duration_ms": 5000,
+    })
+    .to_string();
+    let begin_request = {
+        let addr = server.addr;
+        tokio::spawn(async move {
+            http_request(
+                addr,
+                "POST",
+                "/v1/handoff",
+                &[("Content-Type", "application/json")],
+                &begin_body,
+            )
+            .await
+        })
+    };
+    let begin_ack = match control_rx.recv().await.expect("handoff command") {
+        ohmyserial::broker::SerialControl::BeginHandoff {
+            acknowledgement, ..
+        } => acknowledgement,
+        _ => panic!("unexpected control command"),
+    };
+    begin_ack.send(Ok(())).unwrap();
+    let begin = begin_request.await.unwrap();
+    assert_eq!(begin.status, 200, "response={begin:?}");
+    let handoff_token = begin.json()["handoff"]["handoff_token"]
+        .as_str()
+        .expect("handoff token")
+        .to_owned();
+    let status = http_request(server.addr, "GET", "/v1/status", &[], "").await;
+    assert_eq!(status.status, 200, "response={status:?}");
+    assert_eq!(status.json()["handoff"]["active"], true);
+    assert!(!status.body.contains(&handoff_token));
+
+    let resume_body = json!({"handoff_token": handoff_token}).to_string();
+    let resume_request = {
+        let addr = server.addr;
+        tokio::spawn(async move {
+            http_request(
+                addr,
+                "POST",
+                "/v1/handoff/resume",
+                &[("Content-Type", "application/json")],
+                &resume_body,
+            )
+            .await
+        })
+    };
+    let resume_ack = match control_rx.recv().await.expect("resume command") {
+        ohmyserial::broker::SerialControl::ResumeHandoff { acknowledgement } => acknowledgement,
+        _ => panic!("unexpected control command"),
+    };
+    resume_ack.send(Ok(())).unwrap();
+    let resume = resume_request.await.unwrap();
+    assert_eq!(resume.status, 200, "response={resume:?}");
+    assert!(server.broker.snapshot().handoff.is_none());
+    let evidence = http_request(server.addr, "GET", "/v1/events", &[], "").await;
+    assert!(!evidence.body.contains("handoff_token"));
+    server.shutdown().await;
+}

@@ -243,7 +243,26 @@ API Bearer 用於存取 hub；下文的 `lease_token` 用於獨占 TX，兩者�
 { "op": "dtr", "level": true, "lease_token": "opaque-token" }
 ```
 
-### 3.8 `POST /v1/lock`
+### 3.8 `POST /v1/handoff`
+
+交接需要 `can_control` 與有效 `lease_token`。owner 會先排空/拒絕待寫入
+命令、關閉實體串口，確認 handle 已釋放後才回覆。回覆中的
+`handoff_token` 只可用於一次 `/v1/handoff/resume`，不會進入 status 或事件帳本；
+TTL 到期時 owner 會自動恢復。mock 模式明確拒絕交接。
+
+```json
+{ "duration_ms": 30000, "lease_token": "opaque-token" }
+```
+
+### 3.9 `POST /v1/handoff/resume`
+
+```json
+{ "handoff_token": "opaque-token" }
+```
+
+成功後 owner 重新依 USB identity selector 開啟設備。錯誤或過期 token 會被拒絕。
+
+### 3.10 `POST /v1/lock`
 
 **用途**：申請寫鎖租約。
 
@@ -276,7 +295,7 @@ API Bearer 用於存取 hub；下文的 `lease_token` 用於獨占 TX，兩者�
 
 ---
 
-### 3.9 `DELETE /v1/lock`
+### 3.11 `DELETE /v1/lock`
 
 **用途**：釋放寫鎖。存在有效租約時必須提交它的 token：
 
