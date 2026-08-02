@@ -10,6 +10,7 @@ use parking_lot::{Condvar, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use uuid::Uuid;
 
+use crate::config::SerialSettings;
 use crate::ledger::{
     BytesPayload, ConnectionPayload, ConnectionState, ControlPayload, EventEnvelope, EventPayload,
     GapCertainty, GapPayload, GapScope, Ledger, LedgerError, MemoryOptions,
@@ -100,6 +101,10 @@ impl ControlCommand {
 pub enum SerialControl {
     Command {
         command: ControlCommand,
+        acknowledgement: oneshot::Sender<Result<(), String>>,
+    },
+    Configure {
+        settings: SerialSettings,
         acknowledgement: oneshot::Sender<Result<(), String>>,
     },
     BeginHandoff {
@@ -818,6 +823,100 @@ impl Broker {
                     EventPayload::Control(ControlPayload {
                         actor: Some(actor.to_owned()),
                         name: format!("{name}_rejected"),
+                        value: Some(error.clone()),
+                    }),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Negotiate runtime serial line settings through the serial owner. Like
+    /// physical control lines, changing framing can disrupt a live device, so
+    /// the caller must hold an opaque write lease.
+    pub async fn serial_configure(
+        &self,
+        actor: &str,
+        lease_token: Option<&str>,
+        settings: SerialSettings,
+    ) -> Result<(), String> {
+        Self::validate_actor_label(actor)?;
+        settings.validate()?;
+        let now = Instant::now();
+        let (sender, connection_epoch, timeout) = {
+            let g = self.state.lock();
+            if Self::handoff_is_active(&g) {
+                return Err(
+                    "serial handoff is active; configuration is temporarily unavailable".into(),
+                );
+            }
+            if !g.port.connected {
+                return Err("serial port is disconnected; configuration was not queued".into());
+            }
+            let Some(token) = lease_token else {
+                return Err("configuration requires an active write lease token".into());
+            };
+            if !g
+                .lock
+                .as_ref()
+                .is_some_and(|lock| lock.authorizes(Some(token), now))
+            {
+                return Err("configuration lease expired, was released, or was replaced".into());
+            }
+            let Some(sender) = self.serial_control.lock().clone() else {
+                return Err("serial owner control channel is unavailable".into());
+            };
+            (
+                sender,
+                g.connection_epoch,
+                Duration::from_millis(g.policy.write_timeout_ms.max(1)),
+            )
+        };
+
+        let (acknowledgement, result) = oneshot::channel();
+        let result = match tokio::time::timeout(
+            timeout,
+            sender.send(SerialControl::Configure {
+                settings: settings.clone(),
+                acknowledgement,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => match tokio::time::timeout(timeout, result).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("serial owner dropped the configuration acknowledgement".into()),
+                Err(_) => Err("serial configuration acknowledgement timed out".into()),
+            },
+            Ok(Err(_)) => Err("serial owner control channel is closed".into()),
+            Err(_) => Err("serial configuration queue deadline expired".into()),
+        };
+
+        match result {
+            Ok(()) => {
+                let _ = self.record_event(
+                    connection_epoch,
+                    EventPayload::Control(ControlPayload {
+                        actor: Some(actor.to_owned()),
+                        name: "serial_configured".into(),
+                        value: Some(format!(
+                            "baud={} databits={} parity={} stopbits={} flow={}",
+                            settings.baud,
+                            settings.databits,
+                            settings.parity,
+                            settings.stopbits,
+                            settings.flow
+                        )),
+                    }),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.record_event(
+                    connection_epoch,
+                    EventPayload::Control(ControlPayload {
+                        actor: Some(actor.to_owned()),
+                        name: "serial_configure_rejected".into(),
                         value: Some(error.clone()),
                     }),
                 );
@@ -1973,6 +2072,7 @@ mod tests {
                 command,
                 acknowledgement,
             } => (command, acknowledgement),
+            SerialControl::Configure { .. } => panic!("unexpected configure command"),
             SerialControl::BeginHandoff { .. } | SerialControl::ResumeHandoff { .. } => {
                 panic!("unexpected handoff command")
             }

@@ -24,6 +24,9 @@ pub struct Config {
     /// Optional HTTP/WS control plane bind (also used when a websocket client has no bind).
     #[serde(default)]
     pub api: ApiConfig,
+    /// Optional RFC2217 Telnet serial server for legacy network serial tools.
+    #[serde(default)]
+    pub rfc2217: Rfc2217Config,
 }
 
 /// One-real-port → many parallel monitoring/interaction endpoints.
@@ -108,6 +111,65 @@ pub struct UsbSelector {
     pub pid: u16,
     #[serde(default)]
     pub serial_number: Option<String>,
+}
+
+/// Runtime line settings that can be negotiated by a remote serial protocol
+/// such as RFC2217. The real-port configuration owns the reconnect policy and
+/// device identity; this value only describes the framing/flow parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerialSettings {
+    pub baud: u32,
+    pub databits: u8,
+    pub parity: String,
+    pub stopbits: u8,
+    pub flow: String,
+}
+
+impl SerialSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.baud == 0 {
+            return Err("baud must be greater than zero".into());
+        }
+        if !matches!(self.databits, 5..=8) {
+            return Err("data bits must be 5..=8".into());
+        }
+        if !matches!(self.stopbits, 1 | 2) {
+            return Err("stop bits must be 1 or 2".into());
+        }
+        if !matches!(
+            self.parity.to_ascii_lowercase().as_str(),
+            "none" | "odd" | "even"
+        ) {
+            return Err("parity must be none, odd, or even".into());
+        }
+        if !matches!(
+            self.flow.to_ascii_lowercase().as_str(),
+            "none" | "software" | "hardware"
+        ) {
+            return Err("flow must be none, software, or hardware".into());
+        }
+        Ok(())
+    }
+}
+
+impl RealPortConfig {
+    pub fn serial_settings(&self) -> SerialSettings {
+        SerialSettings {
+            baud: self.baud,
+            databits: self.databits,
+            parity: self.parity.clone(),
+            stopbits: self.stopbits,
+            flow: self.flow.clone(),
+        }
+    }
+
+    pub fn apply_serial_settings(&mut self, settings: &SerialSettings) {
+        self.baud = settings.baud;
+        self.databits = settings.databits;
+        self.parity = settings.parity.clone();
+        self.stopbits = settings.stopbits;
+        self.flow = settings.flow.clone();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +350,36 @@ pub struct ApiConfig {
     pub can_control: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rfc2217Config {
+    /// Enable the RFC2217 server. It is disabled by default because it is a
+    /// raw, unauthenticated serial protocol and must remain loopback-only.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_rfc2217_bind")]
+    pub bind: String,
+    #[serde(default = "default_true")]
+    pub can_read: bool,
+    #[serde(default = "default_true")]
+    pub can_write: bool,
+    /// Permit line-setting/control negotiation. Each operation acquires a
+    /// short-lived write lease internally before touching the real port.
+    #[serde(default)]
+    pub can_control: bool,
+}
+
+impl Default for Rfc2217Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_rfc2217_bind(),
+            can_read: true,
+            can_write: true,
+            can_control: false,
+        }
+    }
+}
+
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
@@ -328,6 +420,7 @@ impl Default for Config {
             log: LogConfig::default(),
             ledger: LedgerConfig::default(),
             api: ApiConfig::default(),
+            rfc2217: Rfc2217Config::default(),
         }
     }
 }
@@ -359,6 +452,9 @@ pub struct QuickShare {
     pub tcp_base_port: u16,
     pub api_bind: String,
     pub mirror_console: bool,
+    pub rfc2217: bool,
+    pub rfc2217_bind: String,
+    pub rfc2217_can_control: bool,
 }
 
 impl Default for QuickShare {
@@ -376,6 +472,9 @@ impl Default for QuickShare {
             tcp_base_port: 8788,
             api_bind: "127.0.0.1:8787".into(),
             mirror_console: true,
+            rfc2217: false,
+            rfc2217_bind: default_rfc2217_bind(),
+            rfc2217_can_control: false,
         }
     }
 }
@@ -471,6 +570,13 @@ impl Config {
                 can_write: true,
                 can_control: false,
             },
+            rfc2217: Rfc2217Config {
+                enabled: q.rfc2217,
+                bind: q.rfc2217_bind,
+                can_read: true,
+                can_write: true,
+                can_control: q.rfc2217_can_control,
+            },
         };
         cfg.expand_fanout()?;
         cfg.validate()?;
@@ -500,6 +606,7 @@ impl Config {
                 "tcp" => "TCP   ",
                 "websocket" => "WS    ",
                 "http" => "HTTP  ",
+                "rfc2217" => "R2217 ",
                 _ => "OTHER ",
             };
             lines.push(format!(
@@ -683,6 +790,16 @@ impl Config {
                 }
             }
         }
+        if self.rfc2217.enabled {
+            out.push(EndpointDesc {
+                kind: "rfc2217".into(),
+                name: "rfc2217".into(),
+                address: format!("rfc2217://{}", self.rfc2217.bind),
+                can_read: self.rfc2217.can_read,
+                can_write: self.rfc2217.can_write,
+                note: "RFC2217 Telnet serial server; loopback-only and legacy-tool focused".into(),
+            });
+        }
         out
     }
 
@@ -736,6 +853,18 @@ impl Config {
                 anyhow::bail!(
                     "at most one websocket client may use the global api /v1/stream route"
                 );
+            }
+        }
+        if self.rfc2217.enabled {
+            let addr = parse_api_bind(&self.rfc2217.bind, "rfc2217.bind")?;
+            if !addr.ip().is_loopback() {
+                anyhow::bail!(
+                    "RFC2217 is unauthenticated and must bind to loopback; use an SSH tunnel for remote access ({})",
+                    self.rfc2217.bind
+                );
+            }
+            if self.rfc2217.can_control && !self.rfc2217.can_write {
+                anyhow::bail!("rfc2217.can_control requires rfc2217.can_write");
             }
         }
         for origin in &self.api.cors_origins {
@@ -953,6 +1082,10 @@ fn default_tcp_bind() -> String {
 fn default_api_bind() -> String {
     "127.0.0.1:8787".into()
 }
+
+fn default_rfc2217_bind() -> String {
+    "127.0.0.1:7000".into()
+}
 fn default_history_bytes() -> usize {
     65_536
 }
@@ -1097,6 +1230,9 @@ bind = "127.0.0.1:9999"
             tcp_base_port: 19010,
             api_bind: "127.0.0.1:19011".into(),
             mirror_console: false,
+            rfc2217: false,
+            rfc2217_bind: "127.0.0.1:19012".into(),
+            rfc2217_can_control: false,
         })
         .unwrap();
         assert_eq!(cfg.real.baud, 9600);

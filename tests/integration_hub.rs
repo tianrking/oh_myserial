@@ -133,6 +133,23 @@ async fn mock_loopback_tcp_and_status() {
 }
 
 #[tokio::test]
+async fn prometheus_metrics_expose_safe_hub_counters() {
+    let api_port = free_port().await;
+    let tcp_port = free_port().await;
+    let cfg = test_config(api_port, tcp_port);
+    let handle = hub::run_hub(cfg).await.expect("hub");
+    let metrics = http_get(&format!("http://127.0.0.1:{api_port}/v1/metrics")).await;
+    assert!(metrics.contains("# TYPE ohmyserial_rx_bytes_total counter"));
+    assert!(metrics.contains("ohmyserial_port_connected 1"));
+    assert!(metrics.contains("ohmyserial_clients_connected"));
+    assert!(
+        !metrics.contains("mock:integration"),
+        "device paths are not labels"
+    );
+    handle.shutdown();
+}
+
+#[tokio::test]
 async fn write_lock_blocks_other_client_name() {
     let api_port = free_port().await;
     let tcp_port = free_port().await;

@@ -1,7 +1,9 @@
 //! Hub supervisor: wires config → serial + broker + clients.
 
 use crate::broker::{Broker, EndpointView, PortStatus};
-use crate::client::{spawn_api_server_owned, spawn_tcp_listener, ApiServerHandle, ApiState};
+use crate::client::{
+    spawn_api_server_owned, spawn_rfc2217_listener, spawn_tcp_listener, ApiServerHandle, ApiState,
+};
 use crate::config::{ClientConfig, Config};
 use crate::ledger::{Ledger, LedgerOptions, MemoryOptions, StoreOptions};
 use crate::observe::SessionLog;
@@ -314,6 +316,21 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
                 }
             }
         }
+    }
+
+    if cfg.rfc2217.enabled {
+        tasks.push(
+            spawn_rfc2217_listener(
+                broker.clone(),
+                "rfc2217".into(),
+                cfg.rfc2217.bind.clone(),
+                cfg.rfc2217.can_read,
+                cfg.rfc2217.can_write,
+                cfg.rfc2217.can_control,
+                cfg.real.serial_settings(),
+            )
+            .await?,
+        );
     }
 
     // No real serial handle is opened until every listener has bound and every

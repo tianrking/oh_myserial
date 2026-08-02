@@ -10,7 +10,7 @@ use serialport::{DataBits, FlowControl, Parity, SerialPortType, StopBits};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::broker::{Broker, ControlCommand, DeviceWrite, PortStatus, SerialControl};
-use crate::config::RealPortConfig;
+use crate::config::{RealPortConfig, SerialSettings};
 
 pub struct SerialHub {
     stop: Arc<StopSignal>,
@@ -90,7 +90,7 @@ impl SerialHub {
 }
 
 fn serial_thread(
-    cfg: RealPortConfig,
+    mut cfg: RealPortConfig,
     broker: Broker,
     mut write_rx: mpsc::Receiver<DeviceWrite>,
     mut control_rx: mpsc::Receiver<SerialControl>,
@@ -126,14 +126,15 @@ fn serial_thread(
                     .event(&format!("serial_open path={resolved_path}"));
                 backoff = Duration::from_millis(cfg.reconnect_ms.max(50));
 
+                let read_timeout_ms = cfg.read_timeout_ms;
                 let outcome = io_loop(
                     &mut *port,
                     &broker,
                     &mut write_rx,
                     &mut control_rx,
                     &stop,
-                    &cfg.flow,
-                    cfg.read_timeout_ms,
+                    &mut cfg,
+                    read_timeout_ms,
                 );
                 match outcome {
                     IoLoopExit::Stop => break,
@@ -217,7 +218,7 @@ fn io_loop(
     write_rx: &mut mpsc::Receiver<DeviceWrite>,
     control_rx: &mut mpsc::Receiver<SerialControl>,
     stop: &StopSignal,
-    flow: &str,
+    cfg: &mut RealPortConfig,
     read_timeout_ms: u64,
 ) -> IoLoopExit {
     const MAX_WRITE_BURST: usize = 32;
@@ -231,7 +232,35 @@ fn io_loop(
         while let Ok(control) = control_rx.try_recv() {
             match control {
                 SerialControl::Command { .. } => {
-                    if !apply_control(port, control, stop, flow) {
+                    if !apply_control(port, control, stop, &cfg.flow) {
+                        return IoLoopExit::Stop;
+                    }
+                }
+                SerialControl::Configure {
+                    settings,
+                    acknowledgement,
+                } => {
+                    let result = apply_serial_settings(port, &settings);
+                    if result.is_ok() {
+                        cfg.apply_serial_settings(&settings);
+                        let current = broker.snapshot().port;
+                        broker.set_port_status(PortStatus {
+                            path: current.path,
+                            baud: settings.baud,
+                            connected: current.connected,
+                            detail: format!(
+                                "open; {}-{}-{}-{} ({})",
+                                settings.baud,
+                                settings.databits,
+                                settings.parity,
+                                settings.stopbits,
+                                settings.flow
+                            ),
+                        });
+                    }
+                    let stopping = stop.is_requested();
+                    let _ = acknowledgement.send(result);
+                    if stopping {
                         return IoLoopExit::Stop;
                     }
                 }
@@ -331,6 +360,13 @@ fn wait_handoff(
                 } => {
                     let _ = acknowledgement.send(Err(
                         "serial owner is released for handoff; resume before control".into(),
+                    ));
+                }
+                SerialControl::Configure {
+                    acknowledgement, ..
+                } => {
+                    let _ = acknowledgement.send(Err(
+                        "serial owner is released for handoff; resume before configuration".into(),
                     ));
                 }
                 SerialControl::BeginHandoff {
@@ -483,6 +519,48 @@ fn apply_control(
     !stopping
 }
 
+fn apply_serial_settings(
+    port: &mut dyn serialport::SerialPort,
+    settings: &SerialSettings,
+) -> Result<(), String> {
+    settings.validate()?;
+    let data = match settings.databits {
+        5 => DataBits::Five,
+        6 => DataBits::Six,
+        7 => DataBits::Seven,
+        8 => DataBits::Eight,
+        _ => return Err("data bits must be 5..=8".into()),
+    };
+    let parity = match settings.parity.to_ascii_lowercase().as_str() {
+        "none" => Parity::None,
+        "odd" => Parity::Odd,
+        "even" => Parity::Even,
+        _ => return Err("parity must be none, odd, or even".into()),
+    };
+    let stop = match settings.stopbits {
+        1 => StopBits::One,
+        2 => StopBits::Two,
+        _ => return Err("stop bits must be 1 or 2".into()),
+    };
+    let flow = match settings.flow.to_ascii_lowercase().as_str() {
+        "none" => FlowControl::None,
+        "software" => FlowControl::Software,
+        "hardware" => FlowControl::Hardware,
+        _ => return Err("flow must be none, software, or hardware".into()),
+    };
+    port.set_baud_rate(settings.baud)
+        .map_err(|error| format!("baud update failed: {error}"))?;
+    port.set_data_bits(data)
+        .map_err(|error| format!("data-bits update failed: {error}"))?;
+    port.set_parity(parity)
+        .map_err(|error| format!("parity update failed: {error}"))?;
+    port.set_stop_bits(stop)
+        .map_err(|error| format!("stop-bits update failed: {error}"))?;
+    port.set_flow_control(flow)
+        .map_err(|error| format!("flow-control update failed: {error}"))?;
+    Ok(())
+}
+
 /// Mock serial: pairs TX back as RX (loopback) and accepts inject via optional channel later.
 fn run_mock(
     cfg: &RealPortConfig,
@@ -506,6 +584,9 @@ fn run_mock(
         while let Ok(control) = control_rx.try_recv() {
             match control {
                 SerialControl::Command {
+                    acknowledgement, ..
+                }
+                | SerialControl::Configure {
                     acknowledgement, ..
                 }
                 | SerialControl::BeginHandoff {
@@ -575,6 +656,9 @@ fn drop_pending_controls(control_rx: &mut mpsc::Receiver<SerialControl>, reason:
     while let Ok(control) = control_rx.try_recv() {
         let acknowledgement = match control {
             SerialControl::Command {
+                acknowledgement, ..
+            }
+            | SerialControl::Configure {
                 acknowledgement, ..
             }
             | SerialControl::BeginHandoff {

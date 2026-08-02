@@ -38,8 +38,8 @@ enum Commands {
         /// Data bits (5, 6, 7, or 8)
         #[arg(long = "data-bits", default_value_t = 8, value_parser = clap::value_parser!(u8).range(5..=8))]
         data_bits: u8,
-        /// Parity: none, odd, even, mark, or space
-        #[arg(long, default_value = "none", value_parser = ["none", "odd", "even", "mark", "space"])]
+        /// Parity: none, odd, or even
+        #[arg(long, default_value = "none", value_parser = ["none", "odd", "even"])]
         parity: String,
         /// Stop bits (1 or 2)
         #[arg(long = "stop-bits", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
@@ -65,6 +65,15 @@ enum Commands {
         /// Open the embedded web console in the default browser
         #[arg(long, default_value_t = false)]
         ui: bool,
+        /// Enable the loopback RFC2217 Telnet serial server
+        #[arg(long, default_value_t = false)]
+        rfc2217: bool,
+        /// RFC2217 listen address
+        #[arg(long, default_value = "127.0.0.1:7000")]
+        rfc2217_bind: String,
+        /// Permit RFC2217 line-setting and DTR/RTS control negotiation
+        #[arg(long, default_value_t = false)]
+        rfc2217_control: bool,
     },
     /// Run from a TOML config file (advanced).
     Run {
@@ -81,7 +90,7 @@ enum Commands {
         #[arg(long = "data-bits", value_parser = clap::value_parser!(u8).range(5..=8))]
         data_bits: Option<u8>,
         /// Optional: override parity
-        #[arg(long, value_parser = ["none", "odd", "even", "mark", "space"])]
+        #[arg(long, value_parser = ["none", "odd", "even"])]
         parity: Option<String>,
         /// Optional: override stop bits
         #[arg(long = "stop-bits", value_parser = clap::value_parser!(u8).range(1..=2))]
@@ -172,6 +181,9 @@ async fn main() -> anyhow::Result<()> {
             api,
             quiet,
             ui,
+            rfc2217,
+            rfc2217_bind,
+            rfc2217_control,
         } => {
             eprintln!("ohmyserial share");
             eprintln!("  device = {device}");
@@ -179,6 +191,14 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("  pty    = {pty} virtual serial(s)  (Unix PTY)");
             eprintln!("  tcp    = {tcp} port(s) from {tcp_base}");
             eprintln!("  api/ws = {api}");
+            eprintln!(
+                "  rfc2217 = {}",
+                if rfc2217 {
+                    rfc2217_bind.as_str()
+                } else {
+                    "disabled"
+                }
+            );
             eprintln!("  ui     = http://{api}/");
             eprintln!();
 
@@ -194,6 +214,9 @@ async fn main() -> anyhow::Result<()> {
                 tcp_base_port: tcp_base,
                 api_bind: api.clone(),
                 mirror_console: !quiet,
+                rfc2217,
+                rfc2217_bind,
+                rfc2217_can_control: rfc2217_control,
             })?;
             run_until_ctrl_c(cfg, ui, Some(api)).await
         }

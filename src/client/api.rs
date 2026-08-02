@@ -130,6 +130,7 @@ pub async fn spawn_api_server_owned(
     let mut app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
+        .route("/v1/metrics", get(metrics))
         .route("/v1/clients", get(clients))
         .route("/v1/endpoints", get(endpoints))
         .route("/v1/events/status", get(events_status))
@@ -360,6 +361,74 @@ async fn status(State(st): State<Arc<ApiState>>) -> Response {
         return permission_denied("read access");
     }
     Json(st.broker.snapshot()).into_response()
+}
+
+/// Prometheus text exposition for local monitoring. Values intentionally use
+/// no user-controlled labels: device paths, client names, and actor strings
+/// can contain secrets or high-cardinality data and must not become metric
+/// labels. Authentication and the read capability apply through the normal
+/// `/v1` middleware.
+async fn metrics(State(st): State<Arc<ApiState>>) -> Response {
+    if !st.can_read {
+        return permission_denied("metrics read access");
+    }
+    let snapshot = st.broker.snapshot();
+    let ledger = st.broker.ledger().status();
+    let connected = u8::from(snapshot.port.connected);
+    let handoff = u8::from(snapshot.handoff.is_some());
+    let body = format!(
+        concat!(
+            "# HELP ohmyserial_port_connected Whether the real serial port is open.\n",
+            "# TYPE ohmyserial_port_connected gauge\n",
+            "ohmyserial_port_connected {connected}\n",
+            "# HELP ohmyserial_port_baud Configured baud rate.\n",
+            "# TYPE ohmyserial_port_baud gauge\n",
+            "ohmyserial_port_baud {baud}\n",
+            "# HELP ohmyserial_handoff_active Whether a maintenance handoff is active.\n",
+            "# TYPE ohmyserial_handoff_active gauge\n",
+            "ohmyserial_handoff_active {handoff}\n",
+            "# HELP ohmyserial_clients_connected Number of connected fan-out clients.\n",
+            "# TYPE ohmyserial_clients_connected gauge\n",
+            "ohmyserial_clients_connected {clients}\n",
+            "# HELP ohmyserial_rx_bytes_total Bytes observed from the serial device.\n",
+            "# TYPE ohmyserial_rx_bytes_total counter\n",
+            "ohmyserial_rx_bytes_total {rx_bytes}\n",
+            "# HELP ohmyserial_tx_bytes_total Bytes confirmed written to the serial device.\n",
+            "# TYPE ohmyserial_tx_bytes_total counter\n",
+            "ohmyserial_tx_bytes_total {tx_bytes}\n",
+            "# HELP ohmyserial_rx_drops_total RX chunks dropped by bounded fan-out queues.\n",
+            "# TYPE ohmyserial_rx_drops_total counter\n",
+            "ohmyserial_rx_drops_total {rx_drops}\n",
+            "# HELP ohmyserial_tx_denies_total TX commands rejected by policy or lease checks.\n",
+            "# TYPE ohmyserial_tx_denies_total counter\n",
+            "ohmyserial_tx_denies_total {tx_denies}\n",
+            "# HELP ohmyserial_ledger_events_retained Number of events retained in the memory ring.\n",
+            "# TYPE ohmyserial_ledger_events_retained gauge\n",
+            "ohmyserial_ledger_events_retained {retained_events}\n",
+            "# HELP ohmyserial_ledger_events_evicted_total Events evicted from the memory ring.\n",
+            "# TYPE ohmyserial_ledger_events_evicted_total counter\n",
+            "ohmyserial_ledger_events_evicted_total {evicted_events}\n",
+            "# HELP ohmyserial_ledger_newest_seq Newest canonical event sequence.\n",
+            "# TYPE ohmyserial_ledger_newest_seq gauge\n",
+            "ohmyserial_ledger_newest_seq {newest_seq}\n"
+        ),
+        connected = connected,
+        baud = snapshot.port.baud,
+        handoff = handoff,
+        clients = snapshot.clients.len(),
+        rx_bytes = snapshot.stats.rx_bytes,
+        tx_bytes = snapshot.stats.tx_bytes,
+        rx_drops = snapshot.stats.rx_drops,
+        tx_denies = snapshot.stats.tx_denies,
+        retained_events = ledger.retained_events,
+        evicted_events = ledger.evicted_events,
+        newest_seq = ledger.newest_seq,
+    );
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+        .into_response()
 }
 
 async fn clients(State(st): State<Arc<ApiState>>) -> Response {

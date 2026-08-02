@@ -119,6 +119,13 @@ pub fn validate_profiles(profiles: &[Config]) -> anyhow::Result<()> {
                 format!("{label} api.bind"),
             )?;
         }
+        if profile.rfc2217.enabled {
+            claim(
+                &mut resources,
+                format!("listen:{}", normalize_key(&profile.rfc2217.bind)),
+                format!("{label} rfc2217.bind"),
+            )?;
+        }
         if let Some(directory) = &profile.ledger.directory {
             claim(
                 &mut resources,
