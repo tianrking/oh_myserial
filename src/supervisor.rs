@@ -200,6 +200,7 @@ mod tests {
             bind: format!("127.0.0.1:{tcp}"),
             can_write: true,
             can_read: true,
+            raw: false,
         }];
         profile
     }

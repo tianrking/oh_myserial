@@ -1,5 +1,6 @@
 //! oh_myserial library surface (used by integration tests and embedding).
 
+pub mod bridge;
 pub mod broker;
 pub mod client;
 pub mod config;

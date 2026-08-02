@@ -20,6 +20,8 @@
 | Hex 校驗和預處理（SUM8 / XOR8 / CRC16 Modbus / CCITT） | ✅ |
 | 日誌顯示模式（文字 / Hex / 兩者）、時間戳、匯出 | ✅ |
 | FireWater CSV / JustFloat LE 分片解析與波形觀察 | ✅ |
+| NMEA 0183 / SLIP / COBS / Modbus RTU 分析 | ✅ |
+| 事件 Actor/Epoch/Hex 篩選、NDJSON 導出、Prometheus 指標 | ✅ |
 | DTR / RTS / BREAK 控制線入口（授權 + 寫鎖保護） | ✅ |
 | 寫鎖取得 / 釋放 | ✅ |
 | 協定說明分頁 | ✅ |

@@ -142,14 +142,15 @@
 | WebSocket | 实时 RX（可带历史） | ✅ |
 | Unix PTY | 符号链接虚拟串口 | ✅（macOS/Linux） |
 | 会话日志 | 控制台 + 文件；text/hex | ✅ |
-| Web 串口控制台 | 会话配置、行尾、Ctrl/⌘+Enter、快捷指令、定时发送、校验和、文本/Hex 日志、FireWater/JustFloat 波形、DTR/RTS/BREAK | ✅ |
+| Web 串口控制台 | 会话配置、行尾、快捷指令、定时发送、校验和、协议分析、波形、证据筛选/导出、指标、DTR/RTS/BREAK | ✅ |
 | 事件账本 | 版本化 RX/TX/连接/控制/gap 证据；有界内存 + 可选哈希 NDJSON | ✅ |
 | 安全回放 | 校验后只读的 `immediate` / `original` / `manual` 回放 | ✅ |
 | Mock 口 | `mock:demo` 无硬件回环 | ✅ |
 | TOML + CLI | `share` / `run` / `init` / `list-ports` / `status` / `supervise` | ✅ |
 | 单进程多真口 | `supervise` 多 profile | ✅ |
-| RFC2217 | 网络串口控制 | 🔜 |
-| Windows 原生虚拟 COM | 驱动级 | 🔜 / 外部桥接 |
+| RFC2217 | 网络串口控制 | ✅ |
+| Windows COM 桥接 | `bridge-com` + 已安装的 com0com/虚拟 COM 对 | ✅ |
+| Windows 原生虚拟 COM | 驱动级 | 外部签名驱动 |
 
 快速启动时也可以直接指定完整串口参数：
 
@@ -157,7 +158,7 @@
 ohmyserial share COM3 --baud 115200 --data-bits 8 --parity none --stop-bits 1 --flow-control none
 ```
 
-`--parity` 支持 `none/odd/even/mark/space`，`--flow-control` 支持
+`--parity` 支持 `none/odd/even`，`--flow-control` 支持
 `none/software/hardware`。TOML 的 `[real]` 配置仍支持相同字段；`run` 命令
 可用同名选项临时覆盖，不会改写配置文件。
 
@@ -222,6 +223,17 @@ CLI / 配置
 **Ubuntu：** 编译前安装 `build-essential pkg-config libudev-dev`。  
 **Windows：** 仅认 COM 的老上位机需 TCP/WS 或外部虚拟 COM 桥；不支持 `type = "pty"`。
 
+COM-only 老软件可以使用内置用户态桥接命令（先用 com0com 等已安装驱动创建
+成对 COM 端点）：
+
+```powershell
+ohmyserial.exe share COM3 --tcp 1 --tcp-raw --tcp-base 8788
+ohmyserial.exe bridge-com COM13 --tcp 127.0.0.1:8788 --baud 115200
+```
+
+完整创建、验证与安全边界见 [`WINDOWS_COM_BRIDGE.md`](./WINDOWS_COM_BRIDGE.md)。
+该命令只转发字节，不安装或冒充 Windows 内核虚拟串口驱动。
+
 ---
 
 ## 安装与编译
@@ -283,11 +295,12 @@ cargo test
 |------|------|------|
 | `--baud N` | 波特率 | `115200` |
 | `--data-bits N` | 数据位（5/6/7/8） | `8` |
-| `--parity VALUE` | 校验（none/odd/even/mark/space） | `none` |
+| `--parity VALUE` | 校验（none/odd/even） | `none` |
 | `--stop-bits N` | 停止位（1/2） | `1` |
 | `--flow-control VALUE` | 流控（none/software/hardware） | `none` |
 | `--pty N` | N 个虚拟串口（Unix） | macOS/Linux=`2`，Windows=`0` |
 | `--tcp N` | N 个 TCP 端口 | `1` |
+| `--tcp-raw` | 二进制桥接/协议客户端的 TCP 原子读取 | 关闭 |
 | `--tcp-base N` | TCP 起始端口 | `8788` |
 | `--api HOST:PORT` | HTTP/WS 地址 | `127.0.0.1:8787` |
 | `--quiet` | 不镜像会话日志到终端 | 关闭 |
@@ -498,10 +511,14 @@ ohmyserial supervise -c board-a.toml -c board-b.toml  # 单进程多真口
 ohmyserial init [-o file]           # 生成示例配置
 ohmyserial list-ports               # 列出串口
 ohmyserial status [--api URL]       # 查询运行状态
+ohmyserial bridge-com COM13 --tcp 127.0.0.1:8788  # 现有 COM 对 -> TCP
 ohmyserial replay <source>          # 校验并输出封存的账本捕获
 ohmyserial replay <source> --mode original --speed 2
 ohmyserial replay <source> --mode manual --step 10
 ```
+
+当 TCP 端点连接二进制协议或 `bridge-com` 时，`share` 请增加 `--tcp-raw`；
+它会跳过按行/分隔符组帧，让每个 TCP 读取块作为一个有界原子 TX 单元进入 Hub。
 
 `share` 和 `run` 支持 `--baud`、`--data-bits`、`--parity`、`--stop-bits`、
 `--flow-control`；`run` 的这些选项只临时覆盖 TOML，不会改写配置文件。完整
@@ -530,6 +547,7 @@ RUST_LOG=debug ohmyserial run -c ohmyserial.toml
 | `GET` | `/v1/events/status` | 账本会话、ring、持久化和恢复状态 |
 | `GET` | `/v1/events` | 按游标查询，可过滤类型/epoch/actor/字节 |
 | `GET` | `/v1/events/export` | 规范事件 NDJSON 导出 |
+| `GET` | `/v1/metrics` | Prometheus 文本指标（遵守读取权限） |
 | `POST` | `/v1/workflows/run` | 有界线性 lease/send/expect 工作流 |
 | `POST` | `/v1/write` | 向设备发送 text 或 hex |
 | `POST` | `/v1/control` | DTR/RTS/BREAK；需要 `can_control` 与租约 token |
@@ -671,7 +689,7 @@ can_read = true
 | Agent / 自动化 | HTTP + WebSocket ✅ |
 | 简单字节流 | TCP `127.0.0.1:8788` ✅ |
 | 硬件 | `path = "COM3"` ✅ |
-| 只认 COM 的老上位机 | 外部桥（如 com0com），尚未内置 |
+| 只认 COM 的老上位机 | `bridge-com` + 已安装的 com0com 等虚拟 COM 提供方 |
 | `type = "pty"` | 不支持 |
 
 ---
@@ -724,7 +742,7 @@ CI：Ubuntu · macOS · Windows。
 | ✅ 证据 | 规范事件账本、可选哈希分段、查询/导出/事件 WS、安全回放 |
 | ✅ 控制面 | 有界工作流、设备身份选择、DTR/RTS/BREAK、独占交接、多端口监督 |
 | ✅ Web 调试 | 会话配置、快捷命令、定时发送、校验和、FireWater/JustFloat、波形观察 |
-| 🔜 后续 | RFC2217、Windows COM 桥文档、更多协议分析器、指标导出 |
+| ✅ 已交付 | RFC2217、Windows COM 桥文档、NMEA/SLIP/COBS/Modbus RTU 分析器、Web 证据工具、Prometheus 指标 |
 
 ---
 

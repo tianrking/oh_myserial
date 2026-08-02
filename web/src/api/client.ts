@@ -30,6 +30,20 @@ async function getJson<T>(
   return res.json() as Promise<T>;
 }
 
+async function getText(
+  url: string,
+  bearerToken?: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const res = await fetch(url, {
+    method: "GET",
+    headers: authHeaders(bearerToken),
+    signal,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  return res.text();
+}
+
 async function sendJson<T>(
   url: string,
   method: string,
@@ -98,6 +112,12 @@ export const hubApi = {
       bearerToken,
       signal,
     ),
+
+  eventsExport: (cfg: ConnectionConfig, bearerToken?: string, signal?: AbortSignal) =>
+    getText(`${httpBase(cfg)}/v1/events/export`, bearerToken, signal),
+
+  metrics: (cfg: ConnectionConfig, bearerToken?: string, signal?: AbortSignal) =>
+    getText(`${httpBase(cfg)}/v1/metrics`, bearerToken, signal),
 
   writeText: (
     cfg: ConnectionConfig,

@@ -108,6 +108,19 @@ API Bearer 用於存取 hub；下文的 `lease_token` 用於獨占 TX，兩者�
 
 ---
 
+### 3.2a `GET /v1/metrics`
+
+以 Prometheus text exposition 格式回傳 Hub 與 ledger 計數器。這個路由沿用
+`api.can_read` 與 Bearer 驗證，不會把裝置路徑、client 名稱或 actor 放進
+label，因此不會因使用者輸入造成高基數或敏感資訊外洩。可直接交給本機
+Prometheus scrape，或由 Web 控制台下載原始 `.prom` 文字。
+
+核心指標包括 `ohmyserial_port_connected`、`ohmyserial_port_baud`、
+`ohmyserial_clients_connected`、RX/TX bytes、RX drops、TX denies，以及
+ledger retained/evicted/newest sequence。
+
+---
+
 ### 3.3 `GET /v1/endpoints`
 
 **用途**：專門列出「一個真串口並聯出的所有端點」。

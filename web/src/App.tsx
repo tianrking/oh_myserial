@@ -23,6 +23,8 @@ import {
   type QuickCommand,
 } from "./commandUtils";
 import EventLedgerPanel from "./EventLedgerPanel";
+import MetricsPanel from "./MetricsPanel";
+import ProtocolInspectorPanel from "./ProtocolInspectorPanel";
 import WaveformPanel from "./WaveformPanel";
 import {
   appendHexChecksum,
@@ -32,7 +34,12 @@ import {
 import {
   parseFireWater,
   parseJustFloat,
+  parseCobs,
+  parseModbusRtu,
+  parseNmea0183,
+  parseSlip,
   protocolLabel,
+  type ProtocolFrame,
   type StreamProtocol,
   type WaveSample,
 } from "./protocolUtils";
@@ -122,6 +129,10 @@ export default function App() {
   const [ledgerLoading, setLedgerLoading] = useState(false);
   const [ledgerError, setLedgerError] = useState<string | null>(null);
   const ledgerAbortRef = useRef<AbortController | null>(null);
+  const [metricsText, setMetricsText] = useState("");
+  const [metricsLoading, setMetricsLoading] = useState(false);
+  const [metricsError, setMetricsError] = useState<string | null>(null);
+  const metricsAbortRef = useRef<AbortController | null>(null);
 
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [paused, setPaused] = useState(false);
@@ -142,11 +153,16 @@ export default function App() {
   const [showTimestamp, setShowTimestamp] = useState(true);
   const [streamProtocol, setStreamProtocol] = useState<StreamProtocol>("raw");
   const [waveSamples, setWaveSamples] = useState<WaveSample[]>([]);
+  const [protocolFrames, setProtocolFrames] = useState<ProtocolFrame[]>([]);
   const [waveChannel, setWaveChannel] = useState(0);
   const streamProtocolRef = useRef<StreamProtocol>(streamProtocol);
   const fireWaterBufferRef = useRef("");
   const fireWaterDecoderRef = useRef(new TextDecoder());
   const justFloatBufferRef = useRef<Uint8Array<ArrayBufferLike>>(new Uint8Array());
+  const nmeaBufferRef = useRef("");
+  const slipBufferRef = useRef<Uint8Array<ArrayBufferLike>>(new Uint8Array());
+  const cobsBufferRef = useRef<Uint8Array<ArrayBufferLike>>(new Uint8Array());
+  const modbusBufferRef = useRef<Uint8Array<ArrayBufferLike>>(new Uint8Array());
   const [quickCommands, setQuickCommands] = useState<QuickCommand[]>(loadQuickCommands);
   const [editingCommandId, setEditingCommandId] = useState<string | null>(null);
   const [quickName, setQuickName] = useState("");
@@ -264,12 +280,45 @@ export default function App() {
     [],
   );
 
+  const consumeProtocolBytes = useCallback((data: Uint8Array) => {
+    const currentProtocol = streamProtocolRef.current;
+    if (currentProtocol === "nmea0183") {
+      const incoming = new TextDecoder().decode(data);
+      const parsed = parseNmea0183(nmeaBufferRef.current, incoming);
+      nmeaBufferRef.current = parsed.remainder;
+      if (parsed.frames.length) setProtocolFrames((previous) => [...previous, ...parsed.frames].slice(-100));
+      return;
+    }
+    if (currentProtocol === "slip") {
+      const parsed = parseSlip(slipBufferRef.current, data);
+      slipBufferRef.current = parsed.remainder;
+      if (parsed.frames.length) setProtocolFrames((previous) => [...previous, ...parsed.frames].slice(-100));
+      return;
+    }
+    if (currentProtocol === "cobs") {
+      const parsed = parseCobs(cobsBufferRef.current, data);
+      cobsBufferRef.current = parsed.remainder;
+      if (parsed.frames.length) setProtocolFrames((previous) => [...previous, ...parsed.frames].slice(-100));
+      return;
+    }
+    if (currentProtocol === "modbusrtu") {
+      const parsed = parseModbusRtu(modbusBufferRef.current, data);
+      modbusBufferRef.current = parsed.remainder;
+      if (parsed.frames.length) setProtocolFrames((previous) => [...previous, ...parsed.frames].slice(-100));
+    }
+  }, []);
+
   useEffect(() => {
     streamProtocolRef.current = streamProtocol;
     fireWaterBufferRef.current = "";
     fireWaterDecoderRef.current = new TextDecoder();
     justFloatBufferRef.current = new Uint8Array();
+    nmeaBufferRef.current = "";
+    slipBufferRef.current = new Uint8Array();
+    cobsBufferRef.current = new Uint8Array();
+    modbusBufferRef.current = new Uint8Array();
     setWaveSamples([]);
+    setProtocolFrames([]);
     setWaveChannel(0);
   }, [streamProtocol]);
 
@@ -319,11 +368,33 @@ export default function App() {
     }
   }, []);
 
+  const refreshMetrics = useCallback(async (cfg: ConnectionConfig, bearerToken?: string) => {
+    metricsAbortRef.current?.abort();
+    const controller = new AbortController();
+    metricsAbortRef.current = controller;
+    setMetricsLoading(true);
+    setMetricsError(null);
+    try {
+      setMetricsText(await hubApi.metrics(cfg, bearerToken, controller.signal));
+    } catch (metricsFailure) {
+      if (!(metricsFailure instanceof DOMException && metricsFailure.name === "AbortError")) {
+        setMetricsError(metricsFailure instanceof Error ? metricsFailure.message : String(metricsFailure));
+      }
+    } finally {
+      if (metricsAbortRef.current === controller) {
+        metricsAbortRef.current = null;
+        setMetricsLoading(false);
+      }
+    }
+  }, []);
+
   const disconnect = useCallback(() => {
     wsRef.current?.close();
     wsRef.current = null;
     ledgerAbortRef.current?.abort();
     ledgerAbortRef.current = null;
+    metricsAbortRef.current?.abort();
+    metricsAbortRef.current = null;
     setWsOpen(false);
     setOnline(false);
     setLeaseToken(null);
@@ -331,6 +402,9 @@ export default function App() {
     setLedgerEvents([]);
     setLedgerError(null);
     setLedgerLoading(false);
+    setMetricsText("");
+    setMetricsError(null);
+    setMetricsLoading(false);
   }, []);
 
   const connect = useCallback(async () => {
@@ -347,6 +421,7 @@ export default function App() {
       await Promise.all([
         refreshMeta(cfg, apiBearerToken),
         refreshLedger(cfg, apiBearerToken),
+        refreshMetrics(cfg, apiBearerToken),
       ]);
 
       wsRef.current?.close();
@@ -372,6 +447,7 @@ export default function App() {
             const text = bytesToText(data);
             const hex = bytesToHex(data);
             consumeWaveBytes(data);
+            consumeProtocolBytes(data);
             pushLog({
               kind: "rx",
               text: meta.isHistoryHint
@@ -395,7 +471,17 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [apiBearerToken, consumeWaveBytes, hostInput, portInput, pushLog, refreshLedger, refreshMeta]);
+  }, [
+    apiBearerToken,
+    consumeProtocolBytes,
+    consumeWaveBytes,
+    hostInput,
+    portInput,
+    pushLog,
+    refreshLedger,
+    refreshMetrics,
+    refreshMeta,
+  ]);
 
   // 定時刷新狀態
   useEffect(() => {
@@ -415,6 +501,7 @@ export default function App() {
     () => () => {
       wsRef.current?.close();
       ledgerAbortRef.current?.abort();
+      metricsAbortRef.current?.abort();
     },
     [],
   );
@@ -548,6 +635,28 @@ export default function App() {
       .join("\n");
     downloadTextFile(`ohmyserial-${new Date().toISOString().replace(/[:.]/g, "-")}.log`, text);
     pushLog({ kind: "sys", text: `已导出 ${logs.length} 条页面日志` });
+  };
+
+  const exportLedger = async () => {
+    try {
+      const ndjson = await hubApi.eventsExport(conn, apiBearerToken);
+      downloadTextFile(
+        `ohmyserial-events-${new Date().toISOString().replace(/[:.]/g, "-")}.ndjson`,
+        ndjson,
+        "application/x-ndjson;charset=utf-8",
+      );
+      pushLog({ kind: "sys", text: `事件证据已导出 ${ndjson.split("\n").filter(Boolean).length} 条` });
+    } catch (exportFailure) {
+      pushLog({ kind: "err", text: `事件导出失败：${exportFailure instanceof Error ? exportFailure.message : String(exportFailure)}` });
+    }
+  };
+
+  const exportMetrics = () => {
+    downloadTextFile(
+      `ohmyserial-metrics-${new Date().toISOString().replace(/[:.]/g, "-")}.prom`,
+      metricsText,
+      "text/plain;charset=utf-8",
+    );
   };
 
   const onLock = async () => {
@@ -1102,6 +1211,10 @@ export default function App() {
                     <option value="raw">RawData</option>
                     <option value="firewater">FireWater CSV</option>
                     <option value="justfloat">JustFloat LE</option>
+                    <option value="nmea0183">NMEA 0183</option>
+                    <option value="slip">SLIP / RFC 1055</option>
+                    <option value="cobs">COBS</option>
+                    <option value="modbusrtu">Modbus RTU</option>
                   </select>
                 </label>
                 <label className="check">
@@ -1140,18 +1253,34 @@ export default function App() {
             onClear={() => setWaveSamples([])}
             protocolLabel={protocolLabel(streamProtocol)}
           />
+          <ProtocolInspectorPanel
+            protocol={streamProtocol}
+            frames={protocolFrames}
+            onClear={() => setProtocolFrames([])}
+          />
         </div>
       )}
 
       {tab === "events" && (
-        <EventLedgerPanel
+        <>
+          <EventLedgerPanel
           status={ledgerStatus}
           events={ledgerEvents}
           loading={ledgerLoading}
           error={ledgerError}
           online={online}
           onRefresh={() => void refreshLedger(conn, apiBearerToken)}
-        />
+          onExport={() => void exportLedger()}
+          />
+          <MetricsPanel
+            text={metricsText}
+            loading={metricsLoading}
+            error={metricsError}
+            online={online}
+            onRefresh={() => void refreshMetrics(conn, apiBearerToken)}
+            onExport={exportMetrics}
+          />
+        </>
       )}
 
       {tab === "endpoints" && (

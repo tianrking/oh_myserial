@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use ohmyserial::config::Config;
+use ohmyserial::config::{ClientConfig, Config};
 use ohmyserial::hub;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -359,6 +359,45 @@ async fn raw_tcp_ingress_reaches_mock_and_fans_out_exact_bytes() {
 
     assert_eq!(&origin_echo, expected);
     assert_eq!(&observer_echo, expected);
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn raw_tcp_atomic_mode_accepts_binary_without_delimiter() {
+    let api_port = free_port().await;
+    let tcp_port = free_port().await;
+    let mut cfg = test_config(api_port, tcp_port);
+    match &mut cfg.clients[0] {
+        ClientConfig::Tcp { raw, .. } => *raw = true,
+        other => panic!("expected tcp client, got {other:?}"),
+    }
+    let handle = hub::run_hub(cfg).await.unwrap();
+
+    let mut origin = TcpStream::connect(format!("127.0.0.1:{tcp_port}"))
+        .await
+        .unwrap();
+    let mut observer = TcpStream::connect(format!("127.0.0.1:{tcp_port}"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let expected = [0x00, 0x01, 0x02, 0xff];
+    origin.write_all(&expected).await.unwrap();
+    let mut origin_echo = [0_u8; 4];
+    let mut observer_echo = [0_u8; 4];
+    tokio::time::timeout(Duration::from_secs(2), origin.read_exact(&mut origin_echo))
+        .await
+        .expect("origin echo timeout")
+        .expect("origin echo read");
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        observer.read_exact(&mut observer_echo),
+    )
+    .await
+    .expect("observer echo timeout")
+    .expect("observer echo read");
+    assert_eq!(origin_echo, expected);
+    assert_eq!(observer_echo, expected);
     handle.shutdown();
 }
 

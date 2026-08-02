@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use ohmyserial::config::{Config, QuickShare};
+use ohmyserial::config::{Config, QuickShare, SerialSettings};
 use ohmyserial::replay::{ReplayMode, ReplayOptions, ReplaySession};
-use ohmyserial::{hub, serial, supervisor};
+use ohmyserial::{bridge, hub, serial, supervisor};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -53,6 +53,9 @@ enum Commands {
         /// Number of TCP fan-out ports (each accepts many clients). Default: 1
         #[arg(long, default_value_t = 1)]
         tcp: u32,
+        /// Preserve each TCP read as an atomic TX unit for binary bridges.
+        #[arg(long, default_value_t = false)]
+        tcp_raw: bool,
         /// First TCP port (then +1, +2, …)
         #[arg(long, default_value_t = 8788)]
         tcp_base: u16,
@@ -74,6 +77,30 @@ enum Commands {
         /// Permit RFC2217 line-setting and DTR/RTS control negotiation
         #[arg(long, default_value_t = false)]
         rfc2217_control: bool,
+    },
+    /// Connect an existing COM/tty endpoint to an ohmyserial raw TCP endpoint.
+    /// On Windows this is intended for one side of a com0com pair.
+    BridgeCom {
+        /// Existing serial endpoint (for example COM12 or /dev/ttyUSB1).
+        device: String,
+        /// Raw TCP endpoint exposed by `share`/`run`.
+        #[arg(long, default_value = "127.0.0.1:8788")]
+        tcp: String,
+        /// Baud rate.
+        #[arg(short, long, default_value_t = 115_200)]
+        baud: u32,
+        /// Data bits (5, 6, 7, or 8).
+        #[arg(long = "data-bits", default_value_t = 8, value_parser = clap::value_parser!(u8).range(5..=8))]
+        data_bits: u8,
+        /// Parity: none, odd, or even.
+        #[arg(long, default_value = "none", value_parser = ["none", "odd", "even"])]
+        parity: String,
+        /// Stop bits (1 or 2).
+        #[arg(long = "stop-bits", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+        stop_bits: u8,
+        /// Flow control: none, software, or hardware.
+        #[arg(long = "flow-control", alias = "flow", default_value = "none", value_parser = ["none", "software", "hardware"])]
+        flow: String,
     },
     /// Run from a TOML config file (advanced).
     Run {
@@ -177,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
             flow,
             pty,
             tcp,
+            tcp_raw,
             tcp_base,
             api,
             quiet,
@@ -189,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("  device = {device}");
             eprintln!("  serial = {baud}-{data_bits}-{parity}-{stop_bits} ({flow})");
             eprintln!("  pty    = {pty} virtual serial(s)  (Unix PTY)");
-            eprintln!("  tcp    = {tcp} port(s) from {tcp_base}");
+            eprintln!("  tcp    = {tcp} port(s) from {tcp_base} (raw={tcp_raw})");
             eprintln!("  api/ws = {api}");
             eprintln!(
                 "  rfc2217 = {}",
@@ -211,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
                 flow,
                 pty_count: pty,
                 tcp_count: tcp,
+                tcp_raw,
                 tcp_base_port: tcp_base,
                 api_bind: api.clone(),
                 mirror_console: !quiet,
@@ -219,6 +248,30 @@ async fn main() -> anyhow::Result<()> {
                 rfc2217_can_control: rfc2217_control,
             })?;
             run_until_ctrl_c(cfg, ui, Some(api)).await
+        }
+        Commands::BridgeCom {
+            device,
+            tcp,
+            baud,
+            data_bits,
+            parity,
+            stop_bits,
+            flow,
+        } => {
+            eprintln!("ohmyserial bridge-com");
+            eprintln!("  serial = {device} ({baud}-{data_bits}-{parity}-{stop_bits}, {flow})");
+            eprintln!("  tcp    = {tcp}");
+            bridge::run_com_bridge(bridge::ComBridgeOptions {
+                device,
+                tcp,
+                settings: SerialSettings {
+                    baud,
+                    databits: data_bits,
+                    parity,
+                    stopbits: stop_bits,
+                    flow,
+                },
+            })
         }
         Commands::Run {
             config,
@@ -476,6 +529,14 @@ slow_client = "drop_oldest"
 bind = "127.0.0.1:8787"
 enabled = true
 
+# Optional loopback RFC2217 server for legacy network serial tools.
+[rfc2217]
+enabled = false
+bind = "127.0.0.1:7000"
+can_read = true
+can_write = true
+can_control = false
+
 [fanout]
 {pty_hint}
 pty_count = {pty_default}
@@ -491,6 +552,7 @@ tcp_base_port = 8788
 tcp_name_prefix = "tcp"
 tcp_can_write = true
 tcp_can_read = true
+tcp_raw = false # true for binary COM bridge clients
 
 [ledger]
 # Always-on bounded memory evidence; uncomment directory for hashed NDJSON capture.

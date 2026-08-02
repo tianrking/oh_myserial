@@ -42,6 +42,7 @@ interface EventLedgerPanelProps {
   error: string | null;
   online: boolean;
   onRefresh: () => void;
+  onExport: () => void;
 }
 
 interface DecodedPreview {
@@ -95,6 +96,28 @@ function safeBase64Preview(payload: LedgerBytesPayload): DecodedPreview {
   } catch {
     return { hex: "", text: "", truncated: false, error: "Base64 解碼失敗" };
   }
+}
+
+function eventBytes(event: LedgerEvent): LedgerBytesPayload[] {
+  if (event.type === "rx" || event.type === "tx") return [event.payload];
+  if (event.type === "gap" && event.payload.bytes) return [event.payload.bytes];
+  return [];
+}
+
+function eventContainsHex(event: LedgerEvent, input: string): boolean {
+  const needle = input.replace(/0x/gi, "").replace(/[\s,;:_-]+/g, "").toLowerCase();
+  if (!needle || !/^[0-9a-f]+$/.test(needle) || needle.length % 2 !== 0) return false;
+  return eventBytes(event).some((payload) => {
+    if (payload.len > MAX_SAFE_DECODE_BYTES || payload.data_base64.length % 4 !== 0) return false;
+    try {
+      const decoded = atob(payload.data_base64);
+      const hex = Array.from(decoded, (character) => character.charCodeAt(0).toString(16).padStart(2, "0"))
+        .join("");
+      return hex.includes(needle);
+    } catch {
+      return false;
+    }
+  });
 }
 
 function formatBytes(bytes: number): string {
@@ -217,13 +240,28 @@ export default function EventLedgerPanel({
   error,
   online,
   onRefresh,
+  onExport,
 }: EventLedgerPanelProps) {
   const [selected, setSelected] = useState<EventTypeSelection>(() => ({
     ...INITIAL_SELECTION,
   }));
+  const [actor, setActor] = useState("");
+  const [epoch, setEpoch] = useState("");
+  const [containsHex, setContainsHex] = useState("");
   const visibleEvents = useMemo(
-    () => events.filter((event) => selected[event.type]),
-    [events, selected],
+    () => events.filter((event) => {
+      if (!selected[event.type]) return false;
+      if (actor.trim()) {
+        const actorText = "actor" in event.payload ? event.payload.actor ?? "" : "";
+        if (!actorText.toLowerCase().includes(actor.trim().toLowerCase())) return false;
+      }
+      if (epoch.trim() && String(event.connection_epoch) !== epoch.trim()) return false;
+      if (containsHex.trim()) {
+        if (!eventContainsHex(event, containsHex.trim())) return false;
+      }
+      return true;
+    }),
+    [actor, containsHex, epoch, events, selected],
   );
 
   return (
@@ -240,6 +278,9 @@ export default function EventLedgerPanel({
           onClick={onRefresh}
         >
           {loading ? "讀取中…" : "手動重新整理"}
+        </button>
+        <button type="button" className="ghost" disabled={!online} onClick={onExport}>
+          导出 NDJSON
         </button>
       </div>
 
@@ -303,6 +344,32 @@ export default function EventLedgerPanel({
           </label>
         ))}
       </fieldset>
+
+      <div className="event-query-filters">
+        <label>
+          Actor
+          <input value={actor} onChange={(event) => setActor(event.target.value)} placeholder="例如 web-ui" />
+        </label>
+        <label>
+          Epoch
+          <input value={epoch} onChange={(event) => setEpoch(event.target.value)} inputMode="numeric" placeholder="全部" />
+        </label>
+        <label>
+          Hex / evidence
+          <input value={containsHex} onChange={(event) => setContainsHex(event.target.value)} placeholder="例如 55 aa" />
+        </label>
+        <button
+          type="button"
+          className="ghost small"
+          onClick={() => {
+            setActor("");
+            setEpoch("");
+            setContainsHex("");
+          }}
+        >
+          清除筛选
+        </button>
+      </div>
 
       <div className="event-list-meta" aria-live="polite">
         顯示 {visibleEvents.length} / {events.length} 筆最近事件

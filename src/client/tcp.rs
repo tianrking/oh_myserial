@@ -15,6 +15,7 @@ pub async fn spawn_tcp_listener(
     bind: String,
     can_read: bool,
     can_write: bool,
+    atomic: bool,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     // Bind eagerly so run_hub can fail atomically instead of advertising a dead
     // endpoint while the listener task merely logs an error.
@@ -37,7 +38,7 @@ pub async fn spawn_tcp_listener(
                         let broker = broker.clone();
                         let name = name.clone();
                         connections.spawn(async move {
-                            if let Err(e) = handle_conn(broker, name, stream, can_read, can_write).await {
+                            if let Err(e) = handle_conn(broker, name, stream, can_read, can_write, atomic).await {
                                 tracing::debug!("tcp connection closed: {e}");
                             }
                         });
@@ -63,6 +64,7 @@ async fn handle_conn(
     stream: TcpStream,
     can_read: bool,
     can_write: bool,
+    atomic: bool,
 ) -> anyhow::Result<()> {
     let peer = stream.peer_addr()?;
     let (id, mut from_broker) =
@@ -91,10 +93,16 @@ async fn handle_conn(
                         .await?;
                     continue;
                 }
-                if let Err(e) = broker
-                    .client_tx(id, Bytes::copy_from_slice(&buf[..n]))
-                    .await
-                {
+                let result = if atomic {
+                    broker
+                        .client_tx_atomic(id, Bytes::copy_from_slice(&buf[..n]))
+                        .await
+                } else {
+                    broker
+                        .client_tx(id, Bytes::copy_from_slice(&buf[..n]))
+                        .await
+                };
+                if let Err(e) = result {
                     tracing::warn!("tcp tx denied: {e}");
                     writer
                         .write_all(format!("!ohmyserial tx denied: {e}\n").as_bytes())

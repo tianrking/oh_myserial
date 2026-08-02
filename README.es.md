@@ -148,8 +148,9 @@ Dispositivo (UART/COM)
 | Puerto mock | `mock:demo` sin hardware | ✅ |
 | TOML + CLI | `share` / `run` / `init` / `list-ports` / `status` / `supervise` | ✅ |
 | Multi-puerto en un proceso | Varios perfiles reales con detección de colisiones | ✅ |
-| RFC2217 | Control serie por red | 🔜 |
-| COM virtual nativo en Windows | Nivel driver | 🔜 / puente externo |
+| RFC2217 | Control serie por red | ✅ |
+| Puente COM en Windows | `bridge-com` + par com0com/COM virtual instalado | ✅ |
+| COM virtual nativo en Windows | Nivel driver | Driver firmado externo |
 
 ### Características técnicas
 
@@ -207,6 +208,18 @@ CLI / Config
 
 **Ubuntu:** instala `build-essential pkg-config libudev-dev` antes de compilar.  
 **Windows:** apps que solo listan COM deben usar TCP/WS o un puente externo; PTY es solo Unix.
+
+Para programas antiguos que solo abren COM, usa `bridge-com` con un par creado
+por com0com u otro proveedor COM virtual ya instalado:
+
+```powershell
+ohmyserial.exe share COM3 --tcp 1 --tcp-raw --tcp-base 8788
+ohmyserial.exe bridge-com COM13 --tcp 127.0.0.1:8788 --baud 115200
+```
+
+Consulta [`WINDOWS_COM_BRIDGE.md`](./WINDOWS_COM_BRIDGE.md) para la instalación
+del par y sus límites. El binario reenvía bytes en modo usuario; no instala un
+driver kernel ni sustituye la firma del controlador.
 
 ---
 
@@ -398,7 +411,11 @@ ohmyserial supervise -c board-a.toml -c board-b.toml
 ohmyserial init [-o file]           # config de ejemplo
 ohmyserial list-ports               # listar puertos
 ohmyserial status [--api URL]       # consultar estado
+ohmyserial bridge-com COM13 --tcp 127.0.0.1:8788  # par COM existente -> TCP
 ```
+
+Añade `--tcp-raw` a `share` para protocolos binarios o `bridge-com`; evita el
+ensamblado por delimitador y conserva cada lectura TCP como una unidad TX atómica acotada.
 
 `share` es el arranque directo de un dispositivo real o `mock:nombre`; `run`
 usa un TOML y permite overrides temporales de los parámetros de línea y
@@ -429,6 +446,7 @@ exactos y recuerda que WebSocket valida también `Origin`.
 | `GET` | `/v1/events` | Historial paginado de eventos |
 | `GET` | `/v1/events/status` | Estado del ledger de eventos |
 | `GET` | `/v1/events/export` | Exportar eventos como JSONL |
+| `GET` | `/v1/metrics` | Métricas Prometheus sin etiquetas controladas por usuarios |
 | `WS` | `/v1/events/stream` | Stream de eventos en vivo |
 | `POST` | `/v1/workflows/run` | Ejecutar workflow acotado |
 | `POST` | `/v1/control` | DTR/RTS/BREAK mediante el dueño serie |
@@ -526,7 +544,7 @@ Abre `/tmp/ohmyserial-ui` en minicom, screen, Serial Studio, etc.
 | Agente / automatización | HTTP + WebSocket ✅ |
 | Flujo simple | TCP `127.0.0.1:8788` ✅ |
 | Hardware | `path = "COM3"` ✅ |
-| UI antigua solo COM | Puente externo (p. ej. com0com) — aún no integrado |
+| UI antigua solo COM | `bridge-com` con com0com u otro proveedor instalado |
 | `type = "pty"` | No soportado |
 
 ---
@@ -575,7 +593,7 @@ CI: Ubuntu · macOS · Windows.
 |------|---------|
 | ✅ Núcleo | Políticas, TCP, HTTP/WS, PTY, mock, logs, CLI y multi-puerto con colisiones |
 | ✅ Control + web | Perfiles, eventos/replay, workflows, lease/handoff, DTR/RTS/BREAK, comandos rápidos, temporizador, checksums y onda |
-| 🔜 Después | RFC2217, guía de puente COM virtual en Windows, más analizadores de protocolo y métricas |
+| ✅ Entregado | RFC2217, guía de puente COM, analizadores NMEA/SLIP/COBS/Modbus RTU, evidencia web y métricas Prometheus |
 
 ---
 

@@ -243,6 +243,7 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
                 bind,
                 can_write,
                 can_read,
+                raw,
             } => {
                 tasks.push(
                     spawn_tcp_listener(
@@ -251,6 +252,7 @@ pub async fn run_hub(cfg: Config) -> anyhow::Result<HubHandle> {
                         bind.clone(),
                         *can_read,
                         *can_write,
+                        *raw,
                     )
                     .await?,
                 );

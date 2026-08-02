@@ -145,14 +145,15 @@ Device (UART/COM)
 | WebSocket stream | Live RX (+ optional history on connect) | ✅ |
 | Unix PTY | Symlinked virtual serial for classic tools | ✅ (macOS/Linux) |
 | Session log | Console + file; text / hex / hex+text | ✅ |
-| Web serial console | Profiles, line endings, quick commands, timed send, checksums, protocol parsing, waveform, control lines | ✅ |
+| Web serial console | Profiles, line endings, quick commands, timed send, checksums, protocol parsing, waveform, evidence filters/export, metrics, control lines | ✅ |
 | Event ledger | Versioned RX/TX/connection/control/gap evidence; bounded memory + optional hashed NDJSON | ✅ |
 | Safe replay | Verified, read-only `immediate` / `original` / `manual` replay | ✅ |
 | Mock port | `mock:demo` loopback without hardware | ✅ |
 | TOML config + CLI | `share` / `run` / `init` / `list-ports` / `status` / `supervise` | ✅ |
 | Multi-port single process | Multiple independent real profiles with collision checks | ✅ |
-| RFC2217 | Telnet serial control over network | 🔜 |
-| Native Windows virtual COM | Kernel/driver-level COM clone | 🔜 / external bridge |
+| RFC2217 | Telnet serial control over network | ✅ |
+| Windows COM bridge | `bridge-com` + existing com0com/virtual-COM pair | ✅ |
+| Native Windows virtual COM | Kernel/driver-level COM clone | External signed driver |
 
 ### Technical features
 
@@ -216,6 +217,18 @@ CLI / Config
 **Ubuntu tip:** install `build-essential pkg-config libudev-dev` before building.
 
 **Windows tip:** apps that only list COM ports need TCP/WS or an external COM bridge; PTY is Unix-only.
+
+For COM-only legacy software, use the built-in user-mode bridge with an
+existing signed virtual-COM provider such as com0com:
+
+```powershell
+ohmyserial.exe share COM3 --tcp 1 --tcp-raw --tcp-base 8788
+ohmyserial.exe bridge-com COM13 --tcp 127.0.0.1:8788 --baud 115200
+```
+
+The complete pair setup and security boundary are documented in
+[`WINDOWS_COM_BRIDGE.md`](./WINDOWS_COM_BRIDGE.md). The bridge forwards bytes;
+it does not install or replace a Windows kernel driver.
 
 ---
 
@@ -317,11 +330,12 @@ HTTP    http://127.0.0.1:8787
 |------|---------|---------|
 | `--pty N` | N virtual serial ports (Unix) | `2` on macOS/Linux, `0` on Windows |
 | `--tcp N` | N TCP ports | `1` |
+| `--tcp-raw` | atomic TCP reads for binary bridge/protocol clients | off |
 | `--tcp-base P` | first TCP port | `8788` |
 | `--api ADDR` | HTTP/WS bind | `127.0.0.1:8787` |
 | `-b/--baud` | baud rate | `115200` |
 | `--data-bits N` | data bits (5/6/7/8) | `8` |
-| `--parity VALUE` | none/odd/even/mark/space | `none` |
+| `--parity VALUE` | none/odd/even | `none` |
 | `--stop-bits N` | stop bits (1/2) | `1` |
 | `--flow-control VALUE` | none/software/hardware | `none` |
 | `--quiet` | disable console session-log mirror | off |
@@ -425,6 +439,7 @@ ohmyserial init -o ohmyserial.toml
 |-------|--------|
 | `pty_count` | N Unix virtual serials (`{prefix}0` …) for multiple serial GUIs |
 | `tcp_count` + `tcp_base_port` | N TCP listeners; **each** accepts many concurrent clients |
+| `tcp_raw` | Preserve each TCP read as an atomic TX unit for binary bridges |
 | `ws_binds` | Extra HTTP/WS servers (primary `[api]` already multi-client) |
 
 ```toml
@@ -517,6 +532,7 @@ ohmyserial supervise -c board-a.toml -c board-b.toml  # multiple real ports
 ohmyserial init [-o file]           # sample config to stdout/file
 ohmyserial list-ports               # list serial devices
 ohmyserial status [--api URL]       # GET /v1/status
+ohmyserial bridge-com COM13 --tcp 127.0.0.1:8788  # existing COM pair -> TCP
 ohmyserial replay <source>          # verify and emit a sealed ledger capture
 ohmyserial replay <source> --mode original --speed 2
 ohmyserial replay <source> --mode manual --step 10
@@ -545,6 +561,7 @@ Browser access is same-origin by default. Requests must also carry a Host author
 | `GET` | `/v1/events/status` | Ledger session, ring, persistence, and recovery status |
 | `GET` | `/v1/events` | Cursor query with type/epoch/actor/byte filters |
 | `GET` | `/v1/events/export` | Canonical event NDJSON export |
+| `GET` | `/v1/metrics` | Prometheus text metrics (read permission applies) |
 | `POST` | `/v1/workflows/run` | Bounded linear lease/send/expect workflow |
 | `POST` | `/v1/write` | Send text or hex to device |
 | `POST` | `/v1/control` | DTR/RTS/BREAK; requires `can_control` and a lease token |
@@ -568,6 +585,10 @@ curl -s -X POST http://127.0.0.1:8787/v1/write \
   -H 'content-type: application/json' \
   -d '{"hex":"41 54 0d 0a","as_client":"agent"}'
 ```
+
+Add `--tcp-raw` to `share` when the TCP endpoint feeds binary protocols or
+`bridge-com`; it bypasses line/frame delimiter assembly and preserves each TCP
+read as one bounded atomic TX unit.
 
 HTTP text and hex writes are one atomic command, independent of delimiter framing. `ok: true` means the serial-owner thread completed the host-side `write_all` and `flush`; it does **not** mean the device parsed or acknowledged the command. Queue admission and that acknowledgement share the `tx.write_timeout_ms` deadline. If an error says the outcome may be partial or unknown, do not blindly retry—the driver may have written some or all bytes before reporting failure or timing out.
 
@@ -697,7 +718,7 @@ Open `/tmp/ohmyserial-ui` in minicom, screen, Serial Studio, etc.
 | Agent / automation | HTTP + WebSocket ✅ |
 | Simple stream | TCP `127.0.0.1:8788` ✅ |
 | Hardware | `path = "COM3"` ✅ |
-| COM-only legacy UI | External bridge (e.g. com0com) — not built-in yet |
+| COM-only legacy UI | `bridge-com` with an installed provider such as com0com |
 | `type = "pty"` | Not supported (config rejected) |
 
 ---
@@ -720,6 +741,7 @@ oh_myserial/
 ├── README.zh-CN.md
 ├── README.es.md
 ├── POSITIONING.md
+├── WINDOWS_COM_BRIDGE.md       # Windows COM-only legacy application bridge
 ├── EVENTS.md                 # Canonical event ledger, persistence, API, replay
 ├── WORKFLOWS.md              # Bounded linear agent workflow contract
 ├── ohmyserial.example.toml
@@ -753,10 +775,11 @@ Protocol (zh-TW): [`web/PROTOCOL.zh-TW.md`](./web/PROTOCOL.zh-TW.md).
 
 The console currently provides browser-local Hub profiles, text/Hex writes with
 explicit line endings, quick commands, 50 ms-minimum timed sending, optional
-SUM8/XOR8/CRC16 preprocessing, text/Hex log views and export, RawData/
-FireWater/JustFloat parsing with a bounded waveform, and guarded
-DTR/RTS/BREAK controls. All writes still go through `/v1/write`; the page does
-not become a second serial owner and does not persist bearer tokens.
+SUM8/XOR8/CRC16 preprocessing, text/Hex log views and export, event Actor/
+Epoch/Hex filters plus NDJSON evidence export, Prometheus metrics, RawData/
+FireWater/JustFloat parsing with a bounded waveform, and NMEA 0183, SLIP, COBS,
+and Modbus RTU frame inspection. All writes still go through `/v1/write`; the
+page does not become a second serial owner and does not persist bearer tokens.
 
 ---
 
@@ -782,7 +805,7 @@ CI: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) — Ubuntu, macOS, 
 | ✅ Automation | Bounded linear workflows with evidence cursors and idempotent request IDs |
 | ✅ Delivered | Device identity, control lines, bounded handoff |
 | ✅ Delivered | Multi-port supervision |
-| 🧭 Later | RFC2217, Windows COM bridge guide, richer web evidence tooling, metrics |
+| ✅ Delivered | RFC2217, Windows COM bridge guide, protocol analyzers, web evidence tooling, Prometheus metrics |
 
 Not core goals: cloud SaaS, heavy GUI installer, kernel virtual-COM driver (unless demand is clear).
 

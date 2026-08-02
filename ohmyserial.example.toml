@@ -52,6 +52,17 @@ can_control = false
 # HTTP: Authorization: Bearer $OHMYSERIAL_API_TOKEN
 # Browser WS: new WebSocket(url, ["bearer", token])
 
+# ========== optional RFC2217 ==========
+# Loopback-only legacy network serial server. It is unauthenticated by the
+# protocol itself; use an SSH tunnel for remote clients. Line/control changes
+# are disabled unless can_control = true and still use the Hub lease path.
+[rfc2217]
+enabled = false
+bind = "127.0.0.1:7000"
+can_read = true
+can_write = true
+can_control = false
+
 # ========== bulk fan-out ==========
 [fanout]
 # macOS / Linux only: set to 2+ to create /tmp/ohmyserial-v0, v1, …
@@ -72,6 +83,8 @@ tcp_base_port = 8788
 tcp_name_prefix = "tcp"
 tcp_can_write = true
 tcp_can_read = true
+# Binary bridge mode: each TCP read is an atomic TX unit (no line delimiter).
+tcp_raw = false
 
 # Optional second API/WS server:
 # ws_binds = ["127.0.0.1:8790"]

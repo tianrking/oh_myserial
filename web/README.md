@@ -42,6 +42,10 @@ data bits, parity, stop bits, and flow control remain Hub CLI/TOML settings.
 - Pause/auto-scroll, timestamp toggle, text/Hex/both log modes, and export.
 - RawData, FireWater CSV, and JustFloat little-endian parsing across chunk
   boundaries, plus a bounded SVG waveform view.
+- NMEA 0183 checksum validation, SLIP and COBS frame decoding, and bounded
+  Modbus RTU shape/CRC inspection across WebSocket chunks.
+- Event-ledger Actor/Epoch/Hex filters, complete NDJSON export, and a
+  Prometheus metrics panel with raw `.prom` download.
 - DTR/RTS/BREAK controls through `POST /v1/control`; the Hub must grant
   `api.can_control` and the page must hold the opaque write lease.
 

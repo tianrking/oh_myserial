@@ -61,6 +61,9 @@ pub struct FanoutConfig {
     pub tcp_can_write: bool,
     #[serde(default = "default_true")]
     pub tcp_can_read: bool,
+    /// Preserve each TCP read as an atomic TX unit for binary bridges.
+    #[serde(default)]
+    pub tcp_raw: bool,
 
     /// Extra dedicated HTTP/WS binds (full API + `/v1/stream`).
     /// The primary `[api].bind` already allows unlimited concurrent WebSocket clients.
@@ -245,6 +248,9 @@ pub enum ClientConfig {
         can_write: bool,
         #[serde(default = "default_true")]
         can_read: bool,
+        /// Preserve TCP read chunks as atomic TX units for binary bridges.
+        #[serde(default)]
+        raw: bool,
     },
     #[serde(rename = "websocket")]
     Websocket {
@@ -415,6 +421,7 @@ impl Default for Config {
                 bind: default_tcp_bind(),
                 can_write: true,
                 can_read: true,
+                raw: false,
             }],
             fanout: FanoutConfig::default(),
             log: LogConfig::default(),
@@ -449,6 +456,7 @@ pub struct QuickShare {
     pub flow: String,
     pub pty_count: u32,
     pub tcp_count: u32,
+    pub tcp_raw: bool,
     pub tcp_base_port: u16,
     pub api_bind: String,
     pub mirror_console: bool,
@@ -469,6 +477,7 @@ impl Default for QuickShare {
             // People-friendly defaults: 2 virtual serials on Unix; TCP everywhere.
             pty_count: default_friendly_pty_count(),
             tcp_count: 1,
+            tcp_raw: false,
             tcp_base_port: 8788,
             api_bind: "127.0.0.1:8787".into(),
             mirror_console: true,
@@ -549,6 +558,7 @@ impl Config {
                 tcp_name_prefix: default_tcp_name_prefix(),
                 tcp_can_write: true,
                 tcp_can_read: true,
+                tcp_raw: q.tcp_raw,
                 ws_binds: Vec::new(),
                 ws_name_prefix: default_ws_name_prefix(),
                 ws_history_bytes: default_history_bytes(),
@@ -685,6 +695,7 @@ impl Config {
                 bind,
                 can_write: f.tcp_can_write,
                 can_read: f.tcp_can_read,
+                raw: f.tcp_raw,
             });
         }
 
@@ -751,13 +762,19 @@ impl Config {
                     bind,
                     can_write,
                     can_read,
+                    raw,
                 } => out.push(EndpointDesc {
                     kind: "tcp".into(),
                     name: name.clone(),
                     address: bind.clone(),
                     can_read: *can_read,
                     can_write: *can_write,
-                    note: "raw stream; many concurrent TCP clients per bind".into(),
+                    note: if *raw {
+                        "raw byte chunks; binary bridge mode; many concurrent clients per bind"
+                            .into()
+                    } else {
+                        "raw stream; many concurrent TCP clients per bind".into()
+                    },
                 }),
                 ClientConfig::Websocket {
                     name,
@@ -1227,6 +1244,7 @@ bind = "127.0.0.1:9999"
             flow: "software".into(),
             pty_count: 0,
             tcp_count: 2,
+            tcp_raw: false,
             tcp_base_port: 19010,
             api_bind: "127.0.0.1:19011".into(),
             mirror_console: false,
@@ -1313,6 +1331,7 @@ tcp_name_prefix = "m"
                 bind: "0.0.0.0:8788".into(),
                 can_write: true,
                 can_read: true,
+                raw: false,
             }],
             ..Config::default()
         };
