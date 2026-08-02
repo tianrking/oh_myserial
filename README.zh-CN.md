@@ -146,7 +146,7 @@
 | 安全回放 | 校验后只读的 `immediate` / `original` / `manual` 回放 | ✅ |
 | Mock 口 | `mock:demo` 无硬件回环 | ✅ |
 | TOML + CLI | `run` / `init` / `list-ports` / `status` / `supervise` | ✅ |
-| 单进程多真口 | 多 profile | 🔜 |
+| 单进程多真口 | `supervise` 多 profile | ✅ |
 | RFC2217 | 网络串口控制 | 🔜 |
 | Windows 原生虚拟 COM | 驱动级 | 🔜 / 外部桥接 |
 
