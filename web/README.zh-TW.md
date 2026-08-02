@@ -13,9 +13,30 @@
 | 客戶端列表 | ✅ |
 | `WS /v1/stream` 即時日誌（文字 + hex） | ✅ |
 | `POST /v1/write` 文字 / hex | ✅ |
+| 文字行尾選擇（無 / LF / CR / CRLF）與 Ctrl/⌘+Enter | ✅ |
+| 快捷指令（文字 / Hex、行尾、編輯、刪除、localStorage） | ✅ |
+| 定時發送（50 ms 起、文字 / Hex） | ✅ |
+| 日誌顯示模式（文字 / Hex / 兩者）、時間戳、匯出 | ✅ |
+| FireWater CSV / JustFloat LE 分片解析與波形觀察 | ✅ |
+| DTR / RTS / BREAK 控制線入口（授權 + 寫鎖保護） | ✅ |
 | 寫鎖取得 / 釋放 | ✅ |
 | 協定說明分頁 | ✅ |
 | 完整協定文件 | ✅ `PROTOCOL.zh-TW.md` |
+
+## 串口工具互動
+
+控制台把 PuTTY 的可靠寫入、SSCOM 的文字/Hex 快速命令，以及 VOFA+ 的
+資料觀察入口放在同一個頁面：
+
+- 文字送出可明確選擇行尾；Hex 送出保留原始位元組，不會被瀏覽器轉碼。
+- 快捷指令只儲存在目前瀏覽器，送出仍走 `POST /v1/write`，因此會繼續受到
+  Hub 的寫鎖、TX 仲裁、大小限制與 host-confirmed 回傳保護。
+- 定時送出最低 50 ms，並使用同一條寫入路徑；停止勾選後不會留下背景計時器。
+- 即時日誌可分開查看文字與 Hex、顯示/隱藏時間戳，並匯出目前頁面保留的日誌。
+
+串口的 baud、data bits、parity、stop bits、flow control 仍由 `run` / `share`
+的 TOML/CLI 設定，在 Hub 重新開啟實體埠時套用；控制台顯示目前埠與 baud，避免
+網頁偷偷改變硬體參數。
 
 ## 推薦用法：嵌在 hub 裡（同源，最穩）
 

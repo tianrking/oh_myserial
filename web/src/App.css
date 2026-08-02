@@ -125,7 +125,8 @@ label.check {
 }
 
 input,
-textarea {
+textarea,
+select {
   background: #0a1020;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -133,6 +134,10 @@ textarea {
   padding: 0.5rem 0.65rem;
   font: inherit;
   min-width: 10rem;
+}
+
+select {
+  min-width: 7rem;
 }
 
 input.port {
@@ -227,11 +232,105 @@ td code {
   grid-column: 1 / -1;
 }
 
+.grid .waveform-panel {
+  grid-column: 1 / -1;
+}
+
+.composer-options,
+.auto-send-row {
+  margin: 0.55rem 0;
+}
+
+.control-row {
+  margin-top: 0.6rem;
+}
+
+.inline-hint {
+  align-self: center;
+  margin: 0;
+}
+
+.interval-input {
+  min-width: 6.5rem;
+  width: 6.5rem;
+}
+
+.quick-panel {
+  grid-column: 1 / -1;
+}
+
+.quick-editor {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.8fr) minmax(6rem, 0.55fr) minmax(12rem, 2fr) minmax(6rem, 0.65fr) auto;
+  gap: 0.6rem;
+  align-items: end;
+}
+
+.quick-editor .quick-payload {
+  min-width: 0;
+}
+
+.quick-editor .quick-payload input {
+  width: 100%;
+}
+
+.quick-list {
+  display: grid;
+  gap: 0.45rem;
+  margin-top: 0.8rem;
+}
+
+.quick-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: #0a1020;
+}
+
+.quick-item-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.quick-item-main code {
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 860px) {
   .grid {
     grid-template-columns: 1fr;
   }
   .header {
+    flex-direction: column;
+  }
+
+  .quick-editor {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .quick-editor .quick-payload {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 560px) {
+  .quick-editor {
+    grid-template-columns: 1fr;
+  }
+
+  .quick-editor .quick-payload {
+    grid-column: auto;
+  }
+
+  .quick-item {
+    align-items: flex-start;
     flex-direction: column;
   }
 }
@@ -325,6 +424,44 @@ td code {
 .msg {
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.waveform-shell {
+  min-height: 220px;
+  margin-top: 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #070c16;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.waveform-shell > .muted {
+  padding: 1.5rem;
+  text-align: center;
+}
+
+.waveform {
+  display: block;
+  width: 100%;
+  height: 220px;
+}
+
+.waveform-grid {
+  stroke: #243049;
+  stroke-width: 1;
+  stroke-dasharray: 5 5;
+}
+
+.waveform-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
 }
 
 table {

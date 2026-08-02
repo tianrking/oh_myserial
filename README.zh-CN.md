@@ -141,6 +141,7 @@
 | WebSocket | 实时 RX（可带历史） | ✅ |
 | Unix PTY | 符号链接虚拟串口 | ✅（macOS/Linux） |
 | 会话日志 | 控制台 + 文件；text/hex | ✅ |
+| Web 串口控制台 | 行尾选择、Ctrl/⌘+Enter、快捷指令、定时发送、文本/Hex 日志与导出 | ✅ |
 | 事件账本 | 版本化 RX/TX/连接/控制/gap 证据；有界内存 + 可选哈希 NDJSON | ✅ |
 | 安全回放 | 校验后只读的 `immediate` / `original` / `manual` 回放 | ✅ |
 | Mock 口 | `mock:demo` 无硬件回环 | ✅ |

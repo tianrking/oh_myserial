@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Web serial-console workflow
+
+- Added explicit text line endings (`none`, `LF`, `CR`, `CRLF`) and Ctrl/⌘+Enter send.
+- Added browser-local quick commands for text and Hex payloads, including edit/delete and per-command line endings.
+- Added bounded timed sending (50 ms minimum) that reuses the authenticated HTTP write path, lease, and TX arbitration.
+- Added text/Hex/both log display modes, timestamp toggle, and page-log export.
+- Added chunk-safe FireWater CSV and JustFloat little-endian float parsing with a bounded SVG waveform view.
+- Added guarded DTR/RTS/BREAK controls to the console; API capability and write lease remain mandatory.
+- Documented the PuTTY/SSCOM/VOFA+-inspired interaction model and the boundary that serial hardware parameters remain Hub CLI/TOML configuration.
+
 ### Device identity
 
 - Added an exact USB VID/PID selector with optional serial-number disambiguation.

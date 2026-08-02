@@ -63,6 +63,11 @@ export interface LockResponse {
   lock?: { owner: string; expires_ms: number; lease_token: string };
 }
 
+export interface ControlResponse {
+  ok: boolean;
+  error?: string;
+}
+
 export interface HealthResponse {
   ok: boolean;
   service: string;

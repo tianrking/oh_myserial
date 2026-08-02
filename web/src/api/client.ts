@@ -1,5 +1,6 @@
 import type {
   ConnectionConfig,
+  ControlResponse,
   EndpointsResponse,
   HealthResponse,
   LedgerEventsQuery,
@@ -156,4 +157,13 @@ export const hubApi = {
       { lease_token },
       bearerToken,
     ),
+
+  control: (
+    cfg: ConnectionConfig,
+    body:
+      | { op: "dtr" | "rts"; level: boolean; as_client?: string; lease_token?: string }
+      | { op: "break"; duration_ms: number; as_client?: string; lease_token?: string },
+    bearerToken?: string,
+  ) =>
+    sendJson<ControlResponse>(`${httpBase(cfg)}/v1/control`, "POST", body, bearerToken),
 };

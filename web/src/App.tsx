@@ -9,7 +9,24 @@ import type {
 } from "./api/types";
 import { httpBase, wsUrl } from "./api/types";
 import { bytesToHex, bytesToText, connectStream } from "./api/wsStream";
+import {
+  appendLineEnding,
+  loadQuickCommands,
+  newCommandId,
+  QUICK_COMMANDS_STORAGE_KEY,
+  type CommandMode,
+  type LineEnding,
+  type QuickCommand,
+} from "./commandUtils";
 import EventLedgerPanel from "./EventLedgerPanel";
+import WaveformPanel from "./WaveformPanel";
+import {
+  parseFireWater,
+  parseJustFloat,
+  protocolLabel,
+  type StreamProtocol,
+  type WaveSample,
+} from "./protocolUtils";
 import "./App.css";
 
 type Tab = "monitor" | "events" | "endpoints" | "protocol";
@@ -25,6 +42,7 @@ type LogLine = {
 const STORAGE_KEY = "ohmyserial.web.conn";
 const CLIENT_NAME = "web-ui";
 const RECENT_EVENT_LIMIT = 200;
+const MAX_QUICK_COMMANDS = 200;
 
 function defaultConn(): ConnectionConfig {
   // 同源：由 hub 提供 http://127.0.0.1:8787/ 時自動連同一主機埠
@@ -61,6 +79,16 @@ function nowTs(): string {
   return new Date().toLocaleTimeString("zh-TW", { hour12: false });
 }
 
+function downloadTextFile(filename: string, content: string, mime = "text/plain;charset=utf-8") {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>("monitor");
   const [conn, setConn] = useState<ConnectionConfig>(loadConn);
@@ -91,7 +119,26 @@ export default function App() {
 
   const [sendText, setSendText] = useState("");
   const [sendHex, setSendHex] = useState("");
-  const [newline, setNewline] = useState(true);
+  const [lineEnding, setLineEnding] = useState<LineEnding>("lf");
+  const [autoSend, setAutoSend] = useState(false);
+  const [autoIntervalMs, setAutoIntervalMs] = useState(1000);
+  const [autoMode, setAutoMode] = useState<CommandMode>("text");
+  const [displayMode, setDisplayMode] = useState<"text" | "hex" | "both">("both");
+  const [showTimestamp, setShowTimestamp] = useState(true);
+  const [streamProtocol, setStreamProtocol] = useState<StreamProtocol>("raw");
+  const [waveSamples, setWaveSamples] = useState<WaveSample[]>([]);
+  const [waveChannel, setWaveChannel] = useState(0);
+  const streamProtocolRef = useRef<StreamProtocol>(streamProtocol);
+  const fireWaterBufferRef = useRef("");
+  const fireWaterDecoderRef = useRef(new TextDecoder());
+  const justFloatBufferRef = useRef<Uint8Array<ArrayBufferLike>>(new Uint8Array());
+  const [quickCommands, setQuickCommands] = useState<QuickCommand[]>(loadQuickCommands);
+  const [editingCommandId, setEditingCommandId] = useState<string | null>(null);
+  const [quickName, setQuickName] = useState("");
+  const [quickMode, setQuickMode] = useState<CommandMode>("text");
+  const [quickPayload, setQuickPayload] = useState("");
+  const [quickLineEnding, setQuickLineEnding] = useState<LineEnding>("lf");
+  const [breakDurationMs, setBreakDurationMs] = useState(100);
   const [busy, setBusy] = useState(false);
   // A write lease is a bearer credential: keep it in memory only and never log it.
   const [leaseToken, setLeaseToken] = useState<string | null>(null);
@@ -99,6 +146,14 @@ export default function App() {
   useEffect(() => {
     pausedRef.current = paused;
   }, [paused]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(QUICK_COMMANDS_STORAGE_KEY, JSON.stringify(quickCommands));
+    } catch {
+      // A private browsing context may deny localStorage. The editor still works in memory.
+    }
+  }, [quickCommands]);
 
   const pushLog = useCallback((line: Omit<LogLine, "id" | "ts"> & { ts?: string }) => {
     setLogs((prev) => {
@@ -125,6 +180,36 @@ export default function App() {
     setOnline(true);
     setError(null);
   }, []);
+
+  const consumeWaveBytes = useCallback(
+    (data: Uint8Array) => {
+      const currentProtocol = streamProtocolRef.current;
+      if (currentProtocol === "raw") return;
+      if (currentProtocol === "firewater") {
+        const parsed = parseFireWater(
+          `${fireWaterBufferRef.current}${fireWaterDecoderRef.current.decode(data, { stream: true })}`,
+        );
+        fireWaterBufferRef.current = parsed.remainder;
+        if (parsed.samples.length === 0) return;
+        setWaveSamples((previous) => [...previous, ...parsed.samples].slice(-800));
+        return;
+      }
+      const parsed = parseJustFloat(justFloatBufferRef.current, data);
+      justFloatBufferRef.current = parsed.remainder;
+      if (parsed.samples.length === 0) return;
+      setWaveSamples((previous) => [...previous, ...parsed.samples].slice(-800));
+    },
+    [],
+  );
+
+  useEffect(() => {
+    streamProtocolRef.current = streamProtocol;
+    fireWaterBufferRef.current = "";
+    fireWaterDecoderRef.current = new TextDecoder();
+    justFloatBufferRef.current = new Uint8Array();
+    setWaveSamples([]);
+    setWaveChannel(0);
+  }, [streamProtocol]);
 
   const refreshLedger = useCallback(async (cfg: ConnectionConfig, bearerToken?: string) => {
     ledgerAbortRef.current?.abort();
@@ -224,6 +309,7 @@ export default function App() {
             if (pausedRef.current) return;
             const text = bytesToText(data);
             const hex = bytesToHex(data);
+            consumeWaveBytes(data);
             pushLog({
               kind: "rx",
               text: meta.isHistoryHint
@@ -247,7 +333,7 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [apiBearerToken, hostInput, portInput, pushLog, refreshLedger, refreshMeta]);
+  }, [apiBearerToken, consumeWaveBytes, hostInput, portInput, pushLog, refreshLedger, refreshMeta]);
 
   // 定時刷新狀態
   useEffect(() => {
@@ -271,50 +357,112 @@ export default function App() {
     [],
   );
 
-  const onSendText = async () => {
-    if (!sendText) return;
-    setBusy(true);
-    try {
-      const r = await hubApi.writeText(conn, sendText, {
-        newline,
-        as_client: CLIENT_NAME,
-        lease_token: leaseToken ?? undefined,
-        bearer_token: apiBearerToken,
-      });
-      if (!r.ok) throw new Error(r.error || "寫入失敗");
-      pushLog({
-        kind: "tx",
-        text: `HTTP 寫入 text ${r.bytes} bytes：${sendText.replace(/\n/g, "\\n")}`,
-      });
-    } catch (e) {
-      pushLog({
-        kind: "err",
-        text: `寫入失敗：${e instanceof Error ? e.message : String(e)}`,
-      });
-    } finally {
-      setBusy(false);
-    }
+  const transmit = useCallback(
+    async (mode: CommandMode, payload: string, ending: LineEnding): Promise<boolean> => {
+      if (mode === "text" ? payload.length === 0 : payload.trim().length === 0) return false;
+      setBusy(true);
+      try {
+        if (mode === "text") {
+          const wire = appendLineEnding(payload, ending);
+          const r = await hubApi.writeText(conn, wire, {
+            newline: false,
+            as_client: CLIENT_NAME,
+            lease_token: leaseToken ?? undefined,
+            bearer_token: apiBearerToken,
+          });
+          if (!r.ok) throw new Error(r.error || "写入失败");
+          pushLog({
+            kind: "tx",
+            text: `HTTP 写入 text ${r.bytes} bytes：${wire
+              .replace(/\r/g, "\\r")
+              .replace(/\n/g, "\\n")}`,
+          });
+        } else {
+          const r = await hubApi.writeHex(conn, payload, {
+            as_client: CLIENT_NAME,
+            lease_token: leaseToken ?? undefined,
+            bearer_token: apiBearerToken,
+          });
+          if (!r.ok) throw new Error(r.error || "写入失败");
+          pushLog({ kind: "tx", text: `HTTP 写入 hex ${r.bytes} bytes：${payload}` });
+        }
+        return true;
+      } catch (e) {
+        pushLog({
+          kind: "err",
+          text: `写入失败：${e instanceof Error ? e.message : String(e)}`,
+        });
+        return false;
+      } finally {
+        setBusy(false);
+      }
+    },
+    [apiBearerToken, conn, leaseToken, pushLog],
+  );
+
+  const onSendText = () => void transmit("text", sendText, lineEnding);
+
+  const onSendHex = () => void transmit("hex", sendHex, "none");
+
+  useEffect(() => {
+    if (!autoSend || !online || autoIntervalMs < 50) return;
+    const timer = window.setInterval(() => {
+      if (busy) return;
+      const payload = autoMode === "text" ? sendText : sendHex;
+      void transmit(autoMode, payload, autoMode === "text" ? lineEnding : "none");
+    }, autoIntervalMs);
+    return () => window.clearInterval(timer);
+  }, [autoIntervalMs, autoMode, autoSend, busy, lineEnding, online, sendHex, sendText, transmit]);
+
+  const resetQuickEditor = () => {
+    setEditingCommandId(null);
+    setQuickName("");
+    setQuickMode("text");
+    setQuickPayload("");
+    setQuickLineEnding("lf");
   };
 
-  const onSendHex = async () => {
-    if (!sendHex.trim()) return;
-    setBusy(true);
-    try {
-      const r = await hubApi.writeHex(conn, sendHex, {
-        as_client: CLIENT_NAME,
-        lease_token: leaseToken ?? undefined,
-        bearer_token: apiBearerToken,
-      });
-      if (!r.ok) throw new Error(r.error || "寫入失敗");
-      pushLog({ kind: "tx", text: `HTTP 寫入 hex ${r.bytes} bytes：${sendHex}` });
-    } catch (e) {
-      pushLog({
-        kind: "err",
-        text: `Hex 寫入失敗：${e instanceof Error ? e.message : String(e)}`,
-      });
-    } finally {
-      setBusy(false);
+  const saveQuickCommand = () => {
+    const name = quickName.trim();
+    if (!name || !quickPayload.trim()) {
+      pushLog({ kind: "err", text: "快捷指令需要名称和内容" });
+      return;
     }
+    const next: QuickCommand = {
+      id: editingCommandId ?? newCommandId(),
+      name,
+      mode: quickMode,
+      payload: quickPayload,
+      lineEnding: quickMode === "text" ? quickLineEnding : "none",
+    };
+    setQuickCommands((previous) => {
+      const withoutCurrent = previous.filter((command) => command.id !== next.id);
+      return [next, ...withoutCurrent].slice(0, MAX_QUICK_COMMANDS);
+    });
+    pushLog({ kind: "sys", text: `${editingCommandId ? "已更新" : "已保存"}快捷指令：${name}` });
+    resetQuickEditor();
+  };
+
+  const editQuickCommand = (command: QuickCommand) => {
+    setEditingCommandId(command.id);
+    setQuickName(command.name);
+    setQuickMode(command.mode);
+    setQuickPayload(command.payload);
+    setQuickLineEnding(command.lineEnding);
+  };
+
+  const deleteQuickCommand = (command: QuickCommand) => {
+    setQuickCommands((previous) => previous.filter((item) => item.id !== command.id));
+    if (editingCommandId === command.id) resetQuickEditor();
+    pushLog({ kind: "sys", text: `已删除快捷指令：${command.name}` });
+  };
+
+  const exportVisibleLogs = () => {
+    const text = logs
+      .map((line) => `${line.ts}\t${line.kind.toUpperCase()}\t${line.text}${line.hex ? `\t${line.hex}` : ""}`)
+      .join("\n");
+    downloadTextFile(`ohmyserial-${new Date().toISOString().replace(/[:.]/g, "-")}.log`, text);
+    pushLog({ kind: "sys", text: `已导出 ${logs.length} 条页面日志` });
   };
 
   const onLock = async () => {
@@ -362,6 +510,37 @@ export default function App() {
         kind: "err",
         text: `解鎖失敗：${e instanceof Error ? e.message : String(e)}`,
       });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onControl = async (
+    body:
+      | { op: "dtr" | "rts"; level: boolean }
+      | { op: "break"; duration_ms: number },
+  ) => {
+    if (!leaseToken) {
+      pushLog({ kind: "err", text: "控制線操作需要先取得寫鎖" });
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await hubApi.control(
+        conn,
+        { ...body, as_client: CLIENT_NAME, lease_token: leaseToken },
+        apiBearerToken,
+      );
+      if (!r.ok) throw new Error(r.error || "控制線操作失敗");
+      pushLog({
+        kind: "sys",
+        text:
+          body.op === "break"
+            ? `BREAK ${body.duration_ms} ms 已確認`
+            : `${body.op.toUpperCase()} ${body.level ? "ON" : "OFF"} 已確認`,
+      });
+    } catch (e) {
+      pushLog({ kind: "err", text: `控制線操作失敗：${e instanceof Error ? e.message : String(e)}` });
     } finally {
       setBusy(false);
     }
@@ -523,6 +702,67 @@ export default function App() {
           </section>
 
           <section className="panel">
+            <h2>控制線</h2>
+            <p className="hint">
+              對應 DTR / RTS / BREAK。需要 Hub 的 <code>api.can_control</code> 與本頁寫鎖；mock
+              只用來測試 API，不宣稱有實體電氣效果。
+            </p>
+            <div className="row control-row">
+              <button
+                type="button"
+                className="ghost"
+                disabled={!online || busy || !leaseToken}
+                onClick={() => void onControl({ op: "dtr", level: true })}
+              >
+                DTR ON
+              </button>
+              <button
+                type="button"
+                className="ghost"
+                disabled={!online || busy || !leaseToken}
+                onClick={() => void onControl({ op: "dtr", level: false })}
+              >
+                DTR OFF
+              </button>
+              <button
+                type="button"
+                className="ghost"
+                disabled={!online || busy || !leaseToken}
+                onClick={() => void onControl({ op: "rts", level: true })}
+              >
+                RTS ON
+              </button>
+              <button
+                type="button"
+                className="ghost"
+                disabled={!online || busy || !leaseToken}
+                onClick={() => void onControl({ op: "rts", level: false })}
+              >
+                RTS OFF
+              </button>
+              <label>
+                BREAK (ms)
+                <input
+                  className="interval-input"
+                  type="number"
+                  min={1}
+                  max={1000}
+                  value={breakDurationMs}
+                  onChange={(e) => setBreakDurationMs(Math.min(1000, Math.max(1, Number(e.target.value) || 1)))}
+                />
+              </label>
+              <button
+                type="button"
+                className="ghost"
+                disabled={!online || busy || !leaseToken}
+                onClick={() => void onControl({ op: "break", duration_ms: breakDurationMs })}
+              >
+                發送 BREAK
+              </button>
+            </div>
+          </section>
+
+          <section className="panel">
             <h2>送出（HTTP /v1/write）</h2>
             <label className="block">
               文字
@@ -530,17 +770,30 @@ export default function App() {
                 rows={3}
                 value={sendText}
                 onChange={(e) => setSendText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                    e.preventDefault();
+                    onSendText();
+                  }
+                }}
                 placeholder="例如 AT 或任意指令"
               />
             </label>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={newline}
-                onChange={(e) => setNewline(e.target.checked)}
-              />
-              自動補換行 \\n
-            </label>
+            <div className="row composer-options">
+              <label>
+                行尾
+                <select
+                  value={lineEnding}
+                  onChange={(e) => setLineEnding(e.target.value as LineEnding)}
+                >
+                  <option value="none">无结尾</option>
+                  <option value="lf">LF (\\n)</option>
+                  <option value="cr">CR (\\r)</option>
+                  <option value="crlf">CRLF (\\r\\n)</option>
+                </select>
+              </label>
+              <span className="hint inline-hint">Ctrl/⌘ + Enter 发送</span>
+            </div>
             <button type="button" disabled={!online || busy} onClick={() => void onSendText()}>
               送出文字
             </button>
@@ -555,9 +808,124 @@ export default function App() {
             <button type="button" disabled={!online || busy} onClick={() => void onSendHex()}>
               送出 Hex
             </button>
+            <div className="row auto-send-row">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={autoSend}
+                  onChange={(e) => setAutoSend(e.target.checked)}
+                  disabled={!online || busy}
+                />
+                定时发送当前内容
+              </label>
+              <label>
+                模式
+                <select value={autoMode} onChange={(e) => setAutoMode(e.target.value as CommandMode)}>
+                  <option value="text">文本</option>
+                  <option value="hex">Hex</option>
+                </select>
+              </label>
+              <label>
+                间隔 (ms)
+                <input
+                  className="interval-input"
+                  type="number"
+                  min={50}
+                  max={86400000}
+                  step={50}
+                  value={autoIntervalMs}
+                  onChange={(e) => setAutoIntervalMs(Math.max(50, Number(e.target.value) || 50))}
+                />
+              </label>
+            </div>
             <p className="hint">
-              可靠回傳請用 HTTP 寫入。WS 也可 TX，但錯誤僅記在 hub 日誌。
+              可靠回传请用 HTTP 写入。定时发送复用同一写锁和安全仲裁，不会绕过 Hub。
             </p>
+          </section>
+
+          <section className="panel quick-panel">
+            <div className="log-head">
+              <div>
+                <h2>快捷指令</h2>
+                <p className="hint">把常用 ASCII/Hex 命令保存到本浏览器，一键发送。</p>
+              </div>
+              {editingCommandId && (
+                <button type="button" className="ghost" onClick={resetQuickEditor}>
+                  取消编辑
+                </button>
+              )}
+            </div>
+            <div className="quick-editor">
+              <label>
+                名称
+                <input
+                  value={quickName}
+                  onChange={(e) => setQuickName(e.target.value)}
+                  placeholder="例如 读取版本"
+                />
+              </label>
+              <label>
+                类型
+                <select value={quickMode} onChange={(e) => setQuickMode(e.target.value as CommandMode)}>
+                  <option value="text">文本</option>
+                  <option value="hex">Hex</option>
+                </select>
+              </label>
+              <label className="quick-payload">
+                内容
+                <input
+                  value={quickPayload}
+                  onChange={(e) => setQuickPayload(e.target.value)}
+                  placeholder={quickMode === "text" ? "AT+VERSION?" : "AA 55 01 00"}
+                />
+              </label>
+              {quickMode === "text" && (
+                <label>
+                  行尾
+                  <select
+                    value={quickLineEnding}
+                    onChange={(e) => setQuickLineEnding(e.target.value as LineEnding)}
+                  >
+                    <option value="none">无结尾</option>
+                    <option value="lf">LF</option>
+                    <option value="cr">CR</option>
+                    <option value="crlf">CRLF</option>
+                  </select>
+                </label>
+              )}
+              <button type="button" disabled={busy} onClick={saveQuickCommand}>
+                {editingCommandId ? "更新指令" : "保存指令"}
+              </button>
+            </div>
+            <div className="quick-list">
+              {quickCommands.length === 0 && <p className="muted">还没有快捷指令。</p>}
+              {quickCommands.map((command) => (
+                <div className="quick-item" key={command.id}>
+                  <div className="quick-item-main">
+                    <strong>{command.name}</strong>
+                    <span className="tag">{command.mode === "text" ? "文本" : "Hex"}</span>
+                    <code>{command.payload}</code>
+                    {command.mode === "text" && <span className="muted">{command.lineEnding}</span>}
+                  </div>
+                  <div className="row">
+                    <button
+                      type="button"
+                      className="small"
+                      disabled={!online || busy}
+                      onClick={() => void transmit(command.mode, command.payload, command.lineEnding)}
+                    >
+                      发送
+                    </button>
+                    <button type="button" className="ghost small" onClick={() => editQuickCommand(command)}>
+                      编辑
+                    </button>
+                    <button type="button" className="ghost small" onClick={() => deleteQuickCommand(command)}>
+                      删除
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
           </section>
 
           <section className="panel log-panel">
@@ -580,8 +948,38 @@ export default function App() {
                   />
                   自動捲動
                 </label>
+                <label>
+                  显示
+                  <select value={displayMode} onChange={(e) => setDisplayMode(e.target.value as typeof displayMode)}>
+                    <option value="both">文本 + Hex</option>
+                    <option value="text">仅文本</option>
+                    <option value="hex">仅 Hex</option>
+                  </select>
+                </label>
+                <label>
+                  解析
+                  <select
+                    value={streamProtocol}
+                    onChange={(e) => setStreamProtocol(e.target.value as StreamProtocol)}
+                  >
+                    <option value="raw">RawData</option>
+                    <option value="firewater">FireWater CSV</option>
+                    <option value="justfloat">JustFloat LE</option>
+                  </select>
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={showTimestamp}
+                    onChange={(e) => setShowTimestamp(e.target.checked)}
+                  />
+                  时间戳
+                </label>
                 <button type="button" className="ghost" onClick={() => setLogs([])}>
                   清空
+                </button>
+                <button type="button" className="ghost" onClick={exportVisibleLogs}>
+                  导出日志
                 </button>
               </div>
             </div>
@@ -589,14 +987,22 @@ export default function App() {
               {logs.length === 0 && <div className="muted">尚無訊息</div>}
               {logs.map((l) => (
                 <div key={l.id} className={`line ${l.kind}`}>
-                  <span className="ts">{l.ts}</span>
+                  <span className="ts">{showTimestamp ? l.ts : ""}</span>
                   <span className="kind">{l.kind.toUpperCase()}</span>
-                  <span className="msg">{l.text}</span>
-                  {l.hex && <span className="hex">{l.hex}</span>}
+                  {displayMode !== "hex" && <span className="msg">{l.text}</span>}
+                  {displayMode !== "text" && l.hex && <span className="hex">{l.hex}</span>}
                 </div>
               ))}
             </div>
           </section>
+
+          <WaveformPanel
+            samples={waveSamples}
+            channel={waveChannel}
+            onChannelChange={setWaveChannel}
+            onClear={() => setWaveSamples([])}
+            protocolLabel={protocolLabel(streamProtocol)}
+          />
         </div>
       )}
 
